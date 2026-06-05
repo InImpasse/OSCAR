@@ -17,10 +17,16 @@
 *.log
 *.metallib
 *.o
+*.obj
 *.so
+*.so.*
+*.dylib
 *.swp
 *.tmp
 *.DS_Store
+*.ptx
+*.cubin
+*.fatbin
 
 # IDE / OS
 
@@ -54,6 +60,13 @@
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
+/compile_commands.json
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Testing/
 
 # Deprecated
 
@@ -148,6 +161,24 @@ flake.lock
 /run-chat.sh
 /run-spec.sh
 /.ccache/
+
+# Local project artifacts
+
+/.omc/
+/.RUD/
+
+# Rotation pipeline artifacts
+
+/rotation/*/GPQA/
+/rotation/*/LCB/
+/rotation/*/MATH/
+/rotation/*/MMLU/
+/rotation/*/Hadamard/
+/rotation/*/qkv_dumps*/
+/rotation/*/rotations*/
+/rotation/*/_eval_*/
+/rotation/*/investigation/
+/rotation/MiniMax-M2.7/
 
 # IDE
 
