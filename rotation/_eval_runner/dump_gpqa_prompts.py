@@ -62,6 +62,8 @@ def _build_argparser():
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--max-tokens", type=int, default=1,
                    help="1 is enough — we only need the prefill pass to fire.")
+    p.add_argument("--api", choices=("chat", "completions"), default="chat",
+                   help="Use completions for base models without a chat_template.")
     p.add_argument("--seed", type=int, default=0)
     return p
 
@@ -92,16 +94,26 @@ def _build_prompts(num_prompts, variant, seed):
     return out
 
 
-def _send_one(client, model, prompt, temperature, top_p, top_k, max_tokens):
+def _send_one(client, model, prompt, temperature, top_p, top_k, max_tokens, api):
     try:
-        client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            extra_body={"top_k": top_k},
-        )
+        if api == "completions":
+            client.completions.create(
+                model=model,
+                prompt=prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                extra_body={"top_k": top_k},
+            )
+        else:
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                extra_body={"top_k": top_k},
+            )
         return "ok"
     except Exception as e:
         return f"err: {e!r}"
@@ -121,7 +133,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
         futs = [
             ex.submit(_send_one, client, args.model, p,
-                      args.temperature, args.top_p, args.top_k, args.max_tokens)
+                      args.temperature, args.top_p, args.top_k, args.max_tokens,
+                      args.api)
             for p in prompts
         ]
         n_ok = n_err = 0

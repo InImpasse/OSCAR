@@ -597,19 +597,70 @@ class TritonAttnBackend(AttentionBackend):
             torch.tensor(unified_k_lens, dtype=torch.int32, device=self.device), dim=0
         )
 
-        result = flash_attn_varlen_func(
-            q=q3,
-            k=unified_k,
-            v=unified_v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max(forward_batch.extend_seq_lens_cpu),
-            max_seqlen_k=max(unified_k_lens) if unified_k_lens else 0,
-            softmax_scale=layer.scaling,
-            causal=causal,
-            window_size=(-1, -1),
-            softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
-        )
+        if torch.cuda.get_device_capability(q3.device)[0] == 12:
+            # SM120 cannot execute the current FA3/FA4 kernels used by this
+            # dense INT2 prefill path. Use SDPA over the already dequantized
+            # per-request K/V so INT2 cache correctness remains testable.
+            outputs = []
+            k_cursor = 0
+            q_group = layer.tp_q_head_num // layer.tp_k_head_num
+            for i, extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
+                extend_len = int(extend_len)
+                q_start = int(extend_start_loc[i].item())
+                q_end = q_start + extend_len
+                k_len = int(unified_k_lens[i])
+                prefix_len = k_len - extend_len
+
+                q_req = q3[q_start:q_end].transpose(0, 1).unsqueeze(0)
+                k_req = unified_k[k_cursor : k_cursor + k_len]
+                v_req = unified_v[k_cursor : k_cursor + k_len]
+                k_cursor += k_len
+
+                if q_group != 1:
+                    k_req = k_req.repeat_interleave(q_group, dim=1)
+                    v_req = v_req.repeat_interleave(q_group, dim=1)
+                k_req = k_req.transpose(0, 1).unsqueeze(0)
+                v_req = v_req.transpose(0, 1).unsqueeze(0)
+
+                attn_mask = None
+                is_causal = False
+                if causal:
+                    try:
+                        from torch.nn.attention.bias import causal_lower_right
+
+                        attn_mask = causal_lower_right(extend_len, k_len)
+                    except Exception:
+                        q_pos = torch.arange(extend_len, device=q3.device)[:, None]
+                        k_pos = torch.arange(k_len, device=q3.device)[None, :]
+                        attn_mask = k_pos <= (prefix_len + q_pos)
+                else:
+                    is_causal = False
+
+                out_req = torch.nn.functional.scaled_dot_product_attention(
+                    q_req,
+                    k_req,
+                    v_req,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=is_causal,
+                    scale=layer.scaling,
+                )
+                outputs.append(out_req.squeeze(0).transpose(0, 1))
+            result = torch.cat(outputs, dim=0) if outputs else q3.new_empty(o.shape)
+        else:
+            result = flash_attn_varlen_func(
+                q=q3,
+                k=unified_k,
+                v=unified_v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max(forward_batch.extend_seq_lens_cpu),
+                max_seqlen_k=max(unified_k_lens) if unified_k_lens else 0,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=(-1, -1),
+                softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
+            )
         result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
         o.copy_(result.view_as(o))
         return o
@@ -1441,6 +1492,19 @@ class TritonAttnBackend(AttentionBackend):
         pre_rotated_k = None
         pre_rotated_v = None
         need_v_inverse = None
+        fp_quant_oscar_extend = False
+
+        use_fp_quant_oscar_prefill = (
+            not self.enable_deterministic
+            and hasattr(kv_pool, "dtype")
+            and kv_pool.dtype != "int2"
+            and _pool_uses_oscar_rotation(kv_pool)
+            and sliding_window_size < 0
+            and self.forward_metadata.custom_mask is None
+            and window_kv_offsets is None
+            and k is not None
+            and v is not None
+        )
         if (
             not self.enable_deterministic
             and use_quantized_dense_prefill
@@ -1460,6 +1524,17 @@ class TritonAttnBackend(AttentionBackend):
                     v.contiguous(),
                 )
             )
+        elif use_fp_quant_oscar_prefill:
+            pre_rotated_q, pre_rotated_k, pre_rotated_v, need_v_inverse = (
+                prepare_quantized_extend_qkv(
+                    kv_pool,
+                    layer,
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous(),
+                    v.contiguous(),
+                )
+            )
+            fp_quant_oscar_extend = True
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache and k is not None and v is not None:
@@ -1476,6 +1551,22 @@ class TritonAttnBackend(AttentionBackend):
                     layer.k_scale,
                     layer.v_scale,
                     already_hadamard_transformed=True,
+                    is_decode=False,
+                )
+            elif (
+                pre_rotated_k is not None
+                and pre_rotated_v is not None
+                and getattr(kv_pool, "dtype", None) != "int2"
+                and _pool_uses_oscar_rotation(kv_pool)
+            ):
+                kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    pre_rotated_k,
+                    pre_rotated_v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    already_oscar_rotated=True,
                     is_decode=False,
                 )
             elif (
@@ -1525,10 +1616,19 @@ class TritonAttnBackend(AttentionBackend):
                 need_v_inverse_override=need_v_inverse,
             )
 
+        q_ext = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_ext = k.contiguous()
+        v_ext = v.contiguous()
+        if fp_quant_oscar_extend:
+            assert pre_rotated_q is not None
+            q_ext = pre_rotated_q
+            k_ext = pre_rotated_k
+            v_ext = pre_rotated_v
+
         self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
+            q_ext,
+            k_ext,
+            v_ext,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1548,6 +1648,15 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        if fp_quant_oscar_extend and need_v_inverse:
+            # extend_attention_fwd writes [total_tokens, tp_q_head_num, v_head_dim];
+            # apply_inverse_v_rotation expects the last dim to be v_head_dim only.
+            o_heads = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            o.copy_(
+                apply_inverse_v_rotation(
+                    o_heads, kv_pool, layer, need_v_inverse
+                ).view_as(o)
+            )
         return o
 
     def _forward_extend_unified(
@@ -1856,8 +1965,15 @@ class TritonAttnBackend(AttentionBackend):
                 o = apply_segmented_hadamard_transform(o)
         else:
             # Standard attention with dequantized or non-quantized KV cache
+            q_dec = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            fp_oscar_decode = (
+                _pool_uses_oscar_rotation(kv_pool) and kv_pool.dtype != "int2"
+            )
+            if fp_oscar_decode:
+                li = layer.layer_id - kv_pool.start_layer
+                q_dec = _apply_oscar_rotation(q_dec, kv_pool._R_k[li])
             self.decode_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                q_dec,
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
@@ -1874,6 +1990,10 @@ class TritonAttnBackend(AttentionBackend):
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
             )
+            if fp_oscar_decode:
+                R_v = kv_pool._R_v[layer.layer_id - kv_pool.start_layer]
+                o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
         return o
 
 

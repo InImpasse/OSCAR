@@ -25,6 +25,10 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
+if (NOT DEFINED CUDA_VERSION OR "${CUDA_VERSION}" STREQUAL "")
+    set(CUDA_VERSION "${CUDAToolkit_VERSION}")
+endif()
+
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
@@ -186,6 +190,7 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_FA3_MINIMAL             "Build a minimal FA3 source set for local validation" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -412,7 +417,8 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
-# Now FA3 support sm80/sm86/sm90
+# Now FA3 supports sm80/sm86/sm90, and can be built for Blackwell SM120
+# with CUDA 12.8+.
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -447,6 +453,12 @@ if (SGL_KERNEL_ENABLE_FA3)
             "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
     endif()
 
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_120a,code=sm_120a"
+        )
+    endif()
+
     file(GLOB FA3_BF16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
@@ -466,6 +478,15 @@ if (SGL_KERNEL_ENABLE_FA3)
     file(GLOB FA3_FP8_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+
+    if (SGL_KERNEL_FA3_MINIMAL)
+        message(STATUS "Building minimal FA3 source set: bf16 head_dim=128 only")
+        file(GLOB FA3_BF16_GEN_SRCS
+            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu")
+        set(FA3_FP16_GEN_SRCS "")
+        set(FA3_FP8_GEN_SRCS "")
+        set(FA3_SM8X_GEN_SRCS "")
+    endif()
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
@@ -494,6 +515,21 @@ if (SGL_KERNEL_ENABLE_FA3)
         FLASHATTENTION_DISABLE_UNEVEN_K
         FLASHATTENTION_VARLEN_ONLY
     )
+
+    if(SGL_KERNEL_FA3_MINIMAL)
+        list(APPEND FLASH_OPS_COMPILE_DEFS
+            FLASHATTENTION_DISABLE_FP16
+            FLASHATTENTION_DISABLE_FP8
+            FLASHATTENTION_DISABLE_HDIM64
+            FLASHATTENTION_DISABLE_HDIM96
+            FLASHATTENTION_DISABLE_HDIM192
+            FLASHATTENTION_DISABLE_HDIM256
+            FLASHATTENTION_DISABLE_SPLIT
+            FLASHATTENTION_DISABLE_PAGEDKV
+            FLASHATTENTION_DISABLE_SOFTCAP
+            FLASHATTENTION_DISABLE_PACKGQA
+        )
+    endif()
 
     if(NOT ENABLE_BELOW_SM90)
         list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)

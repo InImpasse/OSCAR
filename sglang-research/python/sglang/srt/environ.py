@@ -226,6 +226,12 @@ class Envs:
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
+    # When True, load Oscar K/V rotation checkpoints into plain MHA FP8/FP4 KV
+    # pools (not mixed int2) and apply the same Q/K/V rotation semantics as
+    # unified int2 OSCAR: rotate before quant write, rotate Q on decode, and
+    # inverse V on output. Requires SGLANG_OSCAR_K_ROTATION_PATH and
+    # SGLANG_OSCAR_V_ROTATION_PATH. Off by default so normal FP8 KV is unchanged.
+    SGLANG_OSCAR_ROTATE_QUANT_KV = EnvBool(False)
     # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
     # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
     # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation

@@ -98,6 +98,30 @@ def _resolve_quant_group_count(head_dim: int, group_size: Optional[int]) -> int:
     return head_dim // effective_group_size
 
 
+def _mha_int_kv_bytes_per_head_pair(k_head_dim: int, v_head_dim: int, kv_dtype: str) -> int:
+    """Bytes per token per KV-head for MHA int8/int4 pools.
+
+    Layout: packed symmetric integer storage plus a bf16 shadow tensor so
+    existing Triton extend/decode kernels read bf16 K/V without int-specific
+    loads. ``int4`` packs two signed 4-bit values per byte along the last dim
+    (``head_dim`` / ``v_head_dim`` must be even).
+    """
+    if kv_dtype == "int8":
+        physical = k_head_dim + v_head_dim
+        shadow = 2 * (k_head_dim + v_head_dim)
+        return physical + shadow
+    if kv_dtype == "int4":
+        if k_head_dim % 2 != 0 or v_head_dim % 2 != 0:
+            raise ValueError(
+                f"int4 KV cache requires even head_dim and v_head_dim, got "
+                f"k_head_dim={k_head_dim}, v_head_dim={v_head_dim}"
+            )
+        physical = k_head_dim // 2 + v_head_dim // 2
+        shadow = 2 * (k_head_dim + v_head_dim)
+        return physical + shadow
+    raise ValueError(f"unsupported MHA int kv dtype: {kv_dtype}")
+
+
 def _get_int_kv_bytes_per_head_pair(
     k_head_dim: int,
     v_head_dim: int,
@@ -273,6 +297,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_bytes,
             )
             kv_size = None
+        elif kv_cache_dtype in ("int8", "int4"):
+            bytes_per_head = _mha_int_kv_bytes_per_head_pair(
+                model_config.head_dim,
+                model_config.v_head_dim,
+                kv_cache_dtype,
+            )
+            kv_size = None
         else:
             kv_size = torch._utils._element_size(kv_cache_dtype)
             bytes_per_head = None
@@ -360,7 +391,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if (
-            kv_cache_dtype == "int2"
+            kv_cache_dtype in ("int2", "int8", "int4")
             and kv_quant_group_size is not None
         ):
             raise ValueError(
@@ -384,6 +415,22 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     model_config.swa_v_head_dim,
                     kv_cache_dtype,
                     kv_quant_group_size,
+                )
+            )
+            kv_size = None
+        elif kv_cache_dtype in ("int8", "int4"):
+            full_per_token = model_config.get_num_kv_heads(tp_size) * (
+                _mha_int_kv_bytes_per_head_pair(
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    kv_cache_dtype,
+                )
+            )
+            swa_per_token = model_config.get_swa_num_kv_heads(tp_size) * (
+                _mha_int_kv_bytes_per_head_pair(
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                    kv_cache_dtype,
                 )
             )
             kv_size = None

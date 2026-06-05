@@ -2016,6 +2016,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "int2":
             self.kv_cache_dtype = self.server_args.kv_cache_dtype
+        elif self.server_args.kv_cache_dtype in ("int8", "int4"):
+            # Symmetric integer KV (MHA): stored packed + bf16 shadow for Triton
+            # decode/extend kernels (see MHATokenToKVPool).
+            self.kv_cache_dtype = self.server_args.kv_cache_dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

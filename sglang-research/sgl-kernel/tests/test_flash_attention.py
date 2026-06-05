@@ -21,14 +21,19 @@ def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
     #  hidden_dim or some special cases.
-    #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
-    #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
+    #  Right now, fa3 is supported for sm80/sm87, sm86/sm89, sm90, and
+    #  Blackwell sm120 when the extension is built with CUDA 12.8+.
+    #  The main different between sm80/sm87 and sm86/sm89 is the shared
+    #  memory size. you can follow the link below for more information
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
-    #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
+    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a/sm120a.
     return (torch.version.cuda >= "12.3") and (
         torch.cuda.get_device_capability(device)[0] == 9
         or torch.cuda.get_device_capability(device)[0] == 8
+        or (
+            torch.version.cuda >= "12.8"
+            and torch.cuda.get_device_capability(device)[0] == 12
+        )
     )
 
 

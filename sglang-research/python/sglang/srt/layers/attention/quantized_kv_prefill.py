@@ -117,13 +117,38 @@ def prepare_quantized_extend_qkv(
 
     Returns the (possibly) rotated ``q, k, v`` tensors and a flag indicating
     whether the attention output must be inverse-rotated afterwards. For
-    non-int2 pools this is a no-op.
+    non-int2 pools without Oscar rotation matrices loaded, this is a no-op.
     """
     need_v_inverse = False
     kv_dtype = kv_pool.dtype
-    if kv_dtype != "int2":
+    if kv_dtype == "int2":
+        if _pool_uses_oscar_rotation(kv_pool):
+            layer_idx = layer.layer_id - kv_pool.start_layer
+            R_k = kv_pool._R_k[layer_idx]
+            R_v = kv_pool._R_v[layer_idx]
+            v_rotation_absorbed = bool(
+                getattr(layer, "oscar_v_rotation_absorbed", False)
+            )
+            if not q_already_hadamard_transformed:
+                q = _apply_oscar_rotation(q, R_k)
+            if not kv_already_hadamard_transformed:
+                k = _apply_oscar_rotation(k, R_k)
+                if v_rotation_absorbed:
+                    v = v.to(R_v.dtype).contiguous()
+                else:
+                    v = _apply_oscar_rotation(v, R_v)
+            need_v_inverse = True
+            return q, k, v, need_v_inverse
+
+        if not q_already_hadamard_transformed:
+            q = _apply_segmented_hadamard_transform(q)
+        if not kv_already_hadamard_transformed:
+            k = _apply_segmented_hadamard_transform(k)
+            v = _apply_segmented_hadamard_transform(v)
+        need_v_inverse = True
         return q, k, v, need_v_inverse
 
+    # FP8 / FP4 MHA pools with SGLANG_OSCAR_ROTATE_QUANT_KV + rotation checkpoints.
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_k = kv_pool._R_k[layer_idx]
@@ -142,12 +167,6 @@ def prepare_quantized_extend_qkv(
         need_v_inverse = True
         return q, k, v, need_v_inverse
 
-    if not q_already_hadamard_transformed:
-        q = _apply_segmented_hadamard_transform(q)
-    if not kv_already_hadamard_transformed:
-        k = _apply_segmented_hadamard_transform(k)
-        v = _apply_segmented_hadamard_transform(v)
-    need_v_inverse = True
     return q, k, v, need_v_inverse
 
 
@@ -375,13 +394,15 @@ def apply_inverse_v_rotation(
     ``result`` must have shape ``[..., v_head_dim]``; callers should reshape
     beforehand if their output is stored flattened.
     """
-    if not need_v_inverse or kv_pool.dtype != "int2":
+    if not need_v_inverse:
         return result
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_v = kv_pool._R_v[layer_idx]
         return (result.to(R_v.dtype) @ R_v.T).contiguous()
-    return _apply_segmented_hadamard_transform(result)
+    if kv_pool.dtype == "int2":
+        return _apply_segmented_hadamard_transform(result)
+    return result
 
 
 @triton.jit

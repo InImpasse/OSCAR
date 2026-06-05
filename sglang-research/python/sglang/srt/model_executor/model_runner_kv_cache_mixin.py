@@ -529,6 +529,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and self.kv_cache_dtype not in ("int8", "int4")
                         ),
                     )
                 elif enable_mixed_kv:
@@ -632,6 +633,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and self.kv_cache_dtype not in ("int8", "int4")
                         ),
                         model_dtype=self.dtype,
                         kv_cache_quant_group_size=(

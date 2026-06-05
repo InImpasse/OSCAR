@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Iterable, Optional
 
 import torch
@@ -34,6 +36,81 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 
 from .granitemoe import GraniteMoeMoE
+
+
+_DUMP_QKV_CHUNK_ID = 0
+_DUMP_QKV_ACTIVE_CHUNK_ID: int | None = None
+_DUMP_QKV_TOKENS_CAPTURED = 0
+_DUMP_QKV_ENABLED_LOGGED = False
+
+
+def _dump_granite_qkv_if_enabled(
+    layer_id: int,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    num_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    forward_batch: ForwardBatch | None,
+) -> None:
+    """Dump post-RoPE Q/K/V tensors for offline OSCAR rotation calibration."""
+    if os.environ.get("DUMP_KVCACHE", "").lower() not in {"1", "true", "yes"}:
+        return
+    if forward_batch is None or not forward_batch.forward_mode.is_extend():
+        return
+    num_tokens = int(query.shape[0])
+    if num_tokens <= 1:
+        return
+
+    dump_dir = os.environ.get("DUMP_KVCACHE_DIR")
+    if not dump_dir:
+        return
+
+    global _DUMP_QKV_ACTIVE_CHUNK_ID
+    global _DUMP_QKV_CHUNK_ID
+    global _DUMP_QKV_ENABLED_LOGGED
+    global _DUMP_QKV_TOKENS_CAPTURED
+
+    token_budget = int(os.environ.get("DUMP_KVCACHE_TOKENS", "0") or "0")
+    if layer_id == 0:
+        if token_budget > 0 and _DUMP_QKV_TOKENS_CAPTURED >= token_budget:
+            _DUMP_QKV_ACTIVE_CHUNK_ID = None
+            return
+        _DUMP_QKV_ACTIVE_CHUNK_ID = _DUMP_QKV_CHUNK_ID
+        _DUMP_QKV_CHUNK_ID += 1
+        _DUMP_QKV_TOKENS_CAPTURED += num_tokens
+    if _DUMP_QKV_ACTIVE_CHUNK_ID is None:
+        return
+
+    chunk_id = _DUMP_QKV_ACTIVE_CHUNK_ID
+    layer_dir = Path(dump_dir) / f"layer_{layer_id}"
+    try:
+        if layer_id == 0 and not _DUMP_QKV_ENABLED_LOGGED:
+            print(
+                f"[oscar-dump-qkv] enabled dir={dump_dir} token_budget={token_budget}",
+                flush=True,
+            )
+            _DUMP_QKV_ENABLED_LOGGED = True
+
+        q = query.view(num_tokens, num_heads, head_dim).detach().to("cpu")
+        k = key.view(num_tokens, num_key_value_heads, head_dim).detach().to("cpu")
+        v = value.view(num_tokens, num_key_value_heads, head_dim).detach().to("cpu")
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            out_dir = layer_dir / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(tensor, out_dir / f"{chunk_id}.pt")
+        if layer_id == 0:
+            seq_dir = layer_dir / "seq_lens"
+            seq_dir.mkdir(parents=True, exist_ok=True)
+            seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if seq_lens is None:
+                seq_lens = getattr(forward_batch, "seq_lens", None)
+            if seq_lens is not None:
+                torch.save(seq_lens.detach().to("cpu"), seq_dir / f"{chunk_id}.pt")
+    except Exception as e:
+        if layer_id == 0:
+            print(f"[oscar-dump-qkv] failed to dump chunk={chunk_id}: {e}", flush=True)
 
 
 # in vLLM this is in a separate file, but keeping it here for decoupling
@@ -261,6 +338,17 @@ class GraniteMoeHybridAttention(nn.Module):
 
         if self.rotary_emb is not None:
             query, key = self.rotary_emb(positions, query, key)
+
+        _dump_granite_qkv_if_enabled(
+            self.attn.layer_id,
+            query,
+            key,
+            value,
+            self.num_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            forward_batch,
+        )
 
         hidden_states = self.attn(query, key, value, forward_batch=forward_batch)
         del query, key, value

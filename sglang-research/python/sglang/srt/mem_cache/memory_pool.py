@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import is_float4_e2m1fn_x2
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -87,6 +88,47 @@ _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+
+def _kv_dtype_supports_oscar_rotate_quant_kv(dtype) -> bool:
+    """True for plain MHA FP8 / FP4 / int8 / int4 KV when Oscar-on-quant-KV is allowed."""
+    if dtype == "int2":
+        return False
+    if dtype in ("int8", "int4"):
+        return True
+    e4 = getattr(torch, "float8_e4m3fn", None)
+    e5 = getattr(torch, "float8_e5m2", None)
+    if e4 is not None and dtype == e4:
+        return True
+    if e5 is not None and dtype == e5:
+        return True
+    return is_float4_e2m1fn_x2(dtype)
+
+
+def _symmetric_int4_pack(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pack last dimension (must be even) into uint8 with two signed nibbles [-8,7]."""
+    q = (x / scale).round().clamp(-8, 7).to(torch.int32)
+    if q.shape[-1] % 2 != 0:
+        raise ValueError("int4 pack requires even last-dim size")
+    q0 = q[..., 0::2] & 0xF
+    q1 = q[..., 1::2] & 0xF
+    return (q0 << 4 | q1).to(torch.uint8)
+
+
+def _symmetric_int4_unpack(
+    packed: torch.Tensor, scale: float, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    hi = (packed >> 4) & 0xF
+    lo = packed & 0xF
+
+    def _nib(n):
+        n = n.to(torch.int32)
+        return torch.where(n >= 8, n - 16, n)
+
+    hi = _nib(hi)
+    lo = _nib(lo)
+    interleaved = torch.stack([hi, lo], dim=-1).flatten(-2)
+    return interleaved.to(out_dtype) * scale
 
 
 @dataclass(frozen=True)
@@ -768,11 +810,15 @@ class KVCache(abc.ABC):
         self.device = device
         if model_dtype is not None:
             self.model_dtype = model_dtype
-        elif dtype == "int2":
+        elif dtype in ("int2", "int8", "int4"):
             raise ValueError(f"model_dtype is required for {dtype} kv cache")
 
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, "int2"):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            self.store_dtype = torch.uint8
+        elif dtype == "int8":
+            self.store_dtype = torch.int8
+        elif dtype == "int4":
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
@@ -927,6 +973,73 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
+        if self.dtype in ("int8", "int4"):
+            self._per_layer_k_scale = [1.0] * self.layer_num
+            self._per_layer_v_scale = [1.0] * self.layer_num
+
+        self._R_k: Optional[torch.Tensor] = None
+        self._R_v: Optional[torch.Tensor] = None
+        if envs.SGLANG_OSCAR_ROTATE_QUANT_KV.get() and _kv_dtype_supports_oscar_rotate_quant_kv(
+            self.dtype
+        ):
+            try:
+                oscar_cfg = load_oscar_rotation_config()
+                dev = torch.device(self.device)
+                rot_dtype = torch.bfloat16
+                self._R_k = load_oscar_rotations(
+                    oscar_cfg.k_rotation_path,
+                    self.layer_num,
+                    self.start_layer,
+                    self.head_dim,
+                    dev,
+                    rot_dtype,
+                )
+                self._R_v = load_oscar_rotations(
+                    oscar_cfg.v_rotation_path,
+                    self.layer_num,
+                    self.start_layer,
+                    self.v_head_dim,
+                    dev,
+                    rot_dtype,
+                )
+                logger.info(
+                    "Loaded Oscar rotation for quant KV pool (dtype=%s, layers %d..%d)",
+                    self.dtype,
+                    self.start_layer,
+                    self.start_layer + self.layer_num,
+                )
+            except Exception as e:
+                logger.warning(
+                    "SGLANG_OSCAR_ROTATE_QUANT_KV enabled but rotations not loaded: %s",
+                    e,
+                )
+                self._R_k = None
+                self._R_v = None
+
+    def _apply_oscar_rotation_before_quant_write(
+        self,
+        layer: Optional[RadixAttention],
+        layer_id: int,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "_R_k", None) is None:
+            return cache_k, cache_v
+        li = layer_id - self.start_layer
+        Rk = self._R_k[li]
+        Rv = self._R_v[li]
+        absorbed = (
+            bool(getattr(layer, "oscar_v_rotation_absorbed", False))
+            if layer is not None
+            else False
+        )
+        cache_k = (cache_k.to(Rk.dtype) @ Rk).to(cache_k.dtype).contiguous()
+        if absorbed:
+            cache_v = cache_v.to(Rv.dtype).contiguous()
+        else:
+            cache_v = (cache_v.to(Rv.dtype) @ Rv).to(cache_v.dtype).contiguous()
+        return cache_k, cache_v
+
     def _resolve_quant_grouping(
         self, head_dim: int, tensor_name: str
     ) -> tuple[int, int]:
@@ -966,7 +1079,7 @@ class MHATokenToKVPool(KVCache):
         _KV_COPY_NUM_WARPS_LARGE_TILE = 8
         _KV_COPY_NUM_WARPS_SMALL_TILE = 4
 
-        stride_bytes = int(self.data_strides[0].item())
+        stride_bytes = int(self.data_strides.max().item())
         if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
             bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
         elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
@@ -1041,6 +1154,85 @@ class MHATokenToKVPool(KVCache):
                     self.v_scales_zeros = self._allocate_scales_zeros_buffers(
                         self.v_num_scale_groups
                     )
+                elif self.dtype == "int8":
+                    m = self.size + self.page_size
+                    n = self.head_num
+                    k = self.head_dim
+                    vk = self.v_head_dim
+                    self.k_buffer = [
+                        torch.zeros(
+                            (m, n, k),
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (m, n, vk),
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_shadow_bf16 = [
+                        torch.zeros(
+                            (m, n, k),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_shadow_bf16 = [
+                        torch.zeros(
+                            (m, n, vk),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                elif self.dtype == "int4":
+                    if self.head_dim % 2 != 0 or self.v_head_dim % 2 != 0:
+                        raise ValueError(
+                            "int4 KV cache requires even head_dim and v_head_dim, "
+                            f"got head_dim={self.head_dim}, v_head_dim={self.v_head_dim}"
+                        )
+                    m = self.size + self.page_size
+                    n = self.head_num
+                    k = self.head_dim
+                    vk = self.v_head_dim
+                    self.k_buffer = [
+                        torch.zeros(
+                            (m, n, k // 2),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (m, n, vk // 2),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_shadow_bf16 = [
+                        torch.zeros(
+                            (m, n, k),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_shadow_bf16 = [
+                        torch.zeros(
+                            (m, n, vk),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
                 else:
                     # [size, head_num, head_dim] for each layer
                     # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -1071,11 +1263,30 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        if getattr(self, "k_shadow_bf16", None) is not None:
+            sh_k = torch.tensor(
+                [x.data_ptr() for x in self.k_shadow_bf16],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+            sh_v = torch.tensor(
+                [x.data_ptr() for x in self.v_shadow_bf16],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs, self.v_data_ptrs, sh_k, sh_v], dim=0
+            )
+            all_buffers = (
+                self.k_buffer + self.v_buffer + self.k_shadow_bf16 + self.v_shadow_bf16
+            )
+        else:
+            self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+            all_buffers = self.k_buffer + self.v_buffer
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
+                for x in all_buffers
             ],
             device=self.device,
         )
@@ -1083,6 +1294,9 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if getattr(self, "k_shadow_bf16", None) is not None:
+            del self.k_shadow_bf16
+            del self.v_shadow_bf16
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1093,6 +1307,11 @@ class MHATokenToKVPool(KVCache):
         v_size_bytes = 0
         for v_cache in self.v_buffer:
             v_size_bytes += get_tensor_size_bytes(v_cache)
+        if getattr(self, "k_shadow_bf16", None) is not None:
+            for t in self.k_shadow_bf16:
+                k_size_bytes += get_tensor_size_bytes(t)
+            for t in self.v_shadow_bf16:
+                v_size_bytes += get_tensor_size_bytes(t)
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -1155,12 +1374,32 @@ class MHATokenToKVPool(KVCache):
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
+                if getattr(self, "k_shadow_bf16", None) is not None:
+                    li = layer_id
+                    ks = self._per_layer_k_scale[li]
+                    vs = self._per_layer_v_scale[li]
+                    if self.dtype == "int8":
+                        self.k_shadow_bf16[li][chunk_indices] = (
+                            k_chunk.to(torch.float32) * ks
+                        ).to(self.model_dtype)
+                        self.v_shadow_bf16[li][chunk_indices] = (
+                            v_chunk.to(torch.float32) * vs
+                        ).to(self.model_dtype)
+                    elif self.dtype == "int4":
+                        self.k_shadow_bf16[li][chunk_indices] = _symmetric_int4_unpack(
+                            k_chunk, ks
+                        ).to(self.model_dtype)
+                        self.v_shadow_bf16[li][chunk_indices] = _symmetric_int4_unpack(
+                            v_chunk, vs
+                        ).to(self.model_dtype)
         torch.cuda.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.dtype == "int2":
             return self.k_buffer[layer_id - self.start_layer]
+        if self.dtype in ("int8", "int4"):
+            return self.k_shadow_bf16[layer_id - self.start_layer]
         elif self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -1178,6 +1417,8 @@ class MHATokenToKVPool(KVCache):
         # for internal use of referencing
         if self.dtype == "int2":
             return self.v_buffer[layer_id - self.start_layer]
+        if self.dtype in ("int8", "int4"):
+            return self.v_shadow_bf16[layer_id - self.start_layer]
         elif self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
@@ -1253,6 +1494,7 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         already_hadamard_transformed: bool = False,
+        already_oscar_rotated: bool = False,
         is_decode: bool = False,
     ):
         if layer_id_override is not None:
@@ -1327,6 +1569,69 @@ class MHATokenToKVPool(KVCache):
                 )
             return
 
+        if self.dtype == "int8":
+            if not already_oscar_rotated:
+                cache_k, cache_v = self._apply_oscar_rotation_before_quant_write(
+                    layer, layer_id, cache_k, cache_v
+                )
+            li = layer_id - self.start_layer
+            ks = (
+                float(k_scale)
+                if k_scale is not None
+                else float(cache_k.abs().amax().clamp(min=1e-8).item()) / 127.0
+            )
+            vs = (
+                float(v_scale)
+                if v_scale is not None
+                else float(cache_v.abs().amax().clamp(min=1e-8).item()) / 127.0
+            )
+            self._per_layer_k_scale[li] = ks
+            self._per_layer_v_scale[li] = vs
+            kq = (cache_k / ks).clamp(-128, 127).round().to(torch.int8)
+            vq = (cache_v / vs).clamp(-128, 127).round().to(torch.int8)
+            self.k_buffer[li][loc] = kq
+            self.v_buffer[li][loc] = vq
+            self.k_shadow_bf16[li][loc] = (kq.to(torch.float32) * ks).to(
+                self.model_dtype
+            )
+            self.v_shadow_bf16[li][loc] = (vq.to(torch.float32) * vs).to(
+                self.model_dtype
+            )
+            return
+
+        if self.dtype == "int4":
+            if not already_oscar_rotated:
+                cache_k, cache_v = self._apply_oscar_rotation_before_quant_write(
+                    layer, layer_id, cache_k, cache_v
+                )
+            li = layer_id - self.start_layer
+            ks = (
+                float(k_scale)
+                if k_scale is not None
+                else float(cache_k.abs().amax().clamp(min=1e-8).item()) / 7.0
+            )
+            vs = (
+                float(v_scale)
+                if v_scale is not None
+                else float(cache_v.abs().amax().clamp(min=1e-8).item()) / 7.0
+            )
+            self._per_layer_k_scale[li] = ks
+            self._per_layer_v_scale[li] = vs
+            k_pack = _symmetric_int4_pack(cache_k, ks)
+            v_pack = _symmetric_int4_pack(cache_v, vs)
+            self.k_buffer[li][loc] = k_pack
+            self.v_buffer[li][loc] = v_pack
+            k_f = _symmetric_int4_unpack(k_pack, ks).to(self.model_dtype)
+            v_f = _symmetric_int4_unpack(v_pack, vs).to(self.model_dtype)
+            self.k_shadow_bf16[li][loc] = k_f
+            self.v_shadow_bf16[li][loc] = v_f
+            return
+
+        if not already_oscar_rotated:
+            cache_k, cache_v = self._apply_oscar_rotation_before_quant_write(
+                layer, layer_id, cache_k, cache_v
+            )
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1353,7 +1658,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get() and getattr(
+            self, "k_shadow_bf16", None
+        ) is None:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
 
@@ -1501,6 +1808,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        already_hadamard_transformed: bool = False,
+        already_oscar_rotated: bool = False,
         is_decode: bool = False,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -1509,6 +1818,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        _ = already_hadamard_transformed  # INT2-only flag; FP4 pool ignores.
+        if not already_oscar_rotated:
+            cache_k, cache_v = self._apply_oscar_rotation_before_quant_write(
+                layer, layer_id, cache_k, cache_v
+            )
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
