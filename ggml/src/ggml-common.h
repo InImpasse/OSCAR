@@ -182,10 +182,18 @@ typedef struct {
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
 #define QK2_0 32
+#define Q2_0_OWHT_GROUP_SIZE 128
+#define Q2_0_LM_C0 (-0.9816f)
+#define Q2_0_LM_C1 (-0.4528f)
+#define Q2_0_LM_C2 ( 0.4528f)
+#define Q2_0_LM_C3 ( 0.9816f)
+#define Q2_0_LM_T0 (-0.6745f)
+#define Q2_0_LM_T1 ( 0.0f)
+#define Q2_0_LM_T2 ( 0.6745f)
 typedef struct {
-    ggml_half d;           // scale: (max-min)/3
-    ggml_half m;           // min
-    uint8_t qs[QK2_0 / 4]; // 4 packed 2-bit values per byte [0..3]
+    ggml_half d;           // per-block sigma for Lloyd-Max centroids
+    ggml_half m;           // direct path: block mean; OWHT path: group mean in first block, otherwise zero
+    uint8_t qs[QK2_0 / 4]; // 4 packed 2-bit Lloyd-Max centroid codes per byte [0..3]
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == 2 * sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 

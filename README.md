@@ -64,11 +64,44 @@ Runtime env vars:
 | `LLAMA_KV_CLIP_RATIO`  | per-row outlier clip percentile | `0.96` |
 | `LLAMA_KV_HP_SINK`     | high-precision prefix tokens | `512` |
 | `LLAMA_KV_HP_RECENT`   | high-precision recent tokens | `2048` |
+| `LLAMA_KV_HP_NO_FUSED_Q2_0` | disable CUDA fused `q2_0` LP + F16 HP attention (slow concat path) | unset |
+| `LLAMA_KV_Q2_0_OWHT` | enable staged CUDA q2_0 group writer/HP fused decoder; follows `LLAMA_KV_NO_HADAMARD` and `LLAMA_KV_CLIP_RATIO` in the writer (`LLAMA_CUDA_Q2_0_OWHT` is a compatibility alias) | unset |
+
+With `--flash-attn` and `q2_0` LP + F16 HP caches, fused joint-softmax attention is enabled by default on CUDA (see `ggml_flash_attn_ext_q2_0_f16`).
+`q2_0`+HP is not a pure `q2_0` cache: the main K/V cache uses `q2_0`, while the sink+recent HP side cache is stored as F16.
+For prompt-processing batches that do not build the HP attention branch, the LP mask must keep HP-covered positions visible; otherwise sink/recent tokens would be masked from LP without being added back by HP attention.
 
 Code touched (vs upstream): `ggml/src/ggml-quants.c`, `ggml/src/ggml-cpu/quants.c` (Q2_0 quant +
 full-head OWHT + clip + NO_HADAMARD gate), `src/llama-arch.{h,cpp}`, `src/llama-model.h` (register
 `ATTN_K_ROT`/`ATTN_V_ROT`), `src/models/qwen3.cpp` (apply rotations), plus the original Q2_0 type +
 HP-buffer infra (`ggml-common.h`, `llama-kv-cache.cpp`, Metal kernels, …).
+
+### Local CUDA smoke/benchmark snapshot
+
+Measured with `llama-bench -ngl 999 -fa 1 -r 1`, `LLAMA_KV_HP_SINK=512`,
+`LLAMA_KV_HP_RECENT=2048`, and `scripts/measure_vram.sh` on an RTX 5050 Laptop GPU.
+The short/medium/long rows use `-p 512/2048/4096` and `-n 128`.
+
+| model | length | KV | peak MiB | pp t/s | tg t/s |
+|---|---:|---|---:|---:|---:|
+| granite-4.0-1b-base-bf16 | short | f16 | 3764 | 2418.0 | 59.6 |
+| granite-4.0-1b-base-bf16 | short | q2_0 | 3728 | 1889.9 | 63.7 |
+| granite-4.0-1b-base-bf16 | short | q2_0+HP | 3728 | 1187.6 | 58.4 |
+| granite-4.0-1b-base-bf16 | medium | f16 | 3872 | 2710.0 | 59.7 |
+| granite-4.0-1b-base-bf16 | medium | q2_0 | 3746 | 1120.3 | 63.2 |
+| granite-4.0-1b-base-bf16 | medium | q2_0+HP | 3746 | 1123.7 | 64.0 |
+| granite-4.0-1b-base-bf16 | long | f16 | 4032 | 2940.7 | 62.8 |
+| granite-4.0-1b-base-bf16 | long | q2_0 | 3766 | 732.1 | 63.9 |
+| granite-4.0-1b-base-bf16 | long | q2_0+HP | 3766 | 729.7 | 63.2 |
+| gemma-4-E2B-it-bf16 | short | f16 | 5206 | 1727.7 | 41.1 |
+| gemma-4-E2B-it-bf16 | short | q2_0 | 5176 | 1117.4 | 27.6 |
+| gemma-4-E2B-it-bf16 | short | q2_0+HP | 5176 | 1106.6 | 27.9 |
+| gemma-4-E2B-it-bf16 | medium | f16 | 5190 | 2229.1 | 42.2 |
+| gemma-4-E2B-it-bf16 | medium | q2_0 | 5146 | 1008.6 | 27.3 |
+| gemma-4-E2B-it-bf16 | medium | q2_0+HP | 5146 | 1021.7 | 27.1 |
+| gemma-4-E2B-it-bf16 | long | f16 | 5206 | 2714.8 | 46.1 |
+| gemma-4-E2B-it-bf16 | long | q2_0 | 5202 | 51.6 | 26.9 |
+| gemma-4-E2B-it-bf16 | long | q2_0+HP | 5202 | 54.1 | 27.1 |
 
 ---
 

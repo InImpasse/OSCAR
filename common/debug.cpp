@@ -3,15 +3,23 @@
 #include "common.h"
 #include "log.h"
 
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct common_debug_cb_user_data::impl {
     std::vector<uint8_t>    data;
     std::vector<std::regex> tensor_filters;
     bool                    abort_on_nan{false};
+    std::string             dump_dir;
+    bool                    dump_only{false};
+    std::unordered_map<std::string, int> dump_counts;
 };
 
 common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
@@ -29,6 +37,12 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
         }
     }
     pimpl->abort_on_nan = abort_on_nan;
+    if (const char * env = std::getenv("LLAMA_DEBUG_TENSOR_DUMP_DIR")) {
+        pimpl->dump_dir = env;
+    }
+    if (const char * env = std::getenv("LLAMA_DEBUG_TENSOR_DUMP_ONLY")) {
+        pimpl->dump_only = std::string(env) != "0";
+    }
 
     params.cb_eval           = common_debug_cb_eval;
     params.cb_eval_user_data = this;
@@ -75,6 +89,68 @@ static float common_ggml_get_float_value(const uint8_t * data,
 }
 
 #define INDENT "    "
+
+static std::string common_debug_sanitize_filename(std::string name) {
+    for (char & c : name) {
+        if (!std::isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') {
+            c = '_';
+        }
+    }
+    return name;
+}
+
+static bool common_debug_matches_filter(const std::vector<std::regex> & filters, const char * name) {
+    if (filters.empty()) {
+        return true;
+    }
+
+    for (const auto & filter : filters) {
+        if (std::regex_search(name, filter)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void common_debug_dump_tensor(
+        const ggml_tensor * t,
+        const uint8_t * data,
+        size_t n_bytes,
+        common_debug_cb_user_data::impl & cb_data) {
+    namespace fs = std::filesystem;
+
+    if (cb_data.dump_dir.empty()) {
+        return;
+    }
+
+    fs::create_directories(cb_data.dump_dir);
+
+    const std::string name = common_debug_sanitize_filename(t->name[0] ? t->name : "tensor");
+    const int idx = cb_data.dump_counts[name]++;
+
+    const fs::path base = fs::path(cb_data.dump_dir) / (name + "." + std::to_string(idx));
+
+    {
+        std::ofstream out(base.string() + ".bin", std::ios::binary);
+        if (!out) {
+            throw std::runtime_error("failed to open tensor dump file: " + base.string() + ".bin");
+        }
+        out.write(reinterpret_cast<const char *>(data), n_bytes);
+    }
+
+    {
+        std::ofstream meta(base.string() + ".meta.txt");
+        if (!meta) {
+            throw std::runtime_error("failed to open tensor metadata file: " + base.string() + ".meta.txt");
+        }
+        meta << "name=" << t->name << "\n";
+        meta << "type=" << ggml_type_name(t->type) << "\n";
+        meta << "nbytes=" << n_bytes << "\n";
+        meta << "ne=" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "\n";
+        meta << "nb=" << t->nb[0] << "," << t->nb[1] << "," << t->nb[2] << "," << t->nb[3] << "\n";
+    }
+}
 
 static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
     GGML_ASSERT(n > 0);
@@ -144,30 +220,21 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb_data = (common_debug_cb_user_data *) user_data;
     auto * pimpl = cb_data->pimpl.get();
 
-    const struct ggml_tensor * src0 = t->src[0];
-    const struct ggml_tensor * src1 = t->src[1];
+    const bool matches_filter = common_debug_matches_filter(pimpl->tensor_filters, t->name);
 
     if (ask) {
-        return true;  // Always retrieve data
+        return matches_filter;
     }
 
-    bool matches_filter = pimpl->tensor_filters.empty();
-
-    if (!matches_filter) {
-        for (const auto & filter : pimpl->tensor_filters) {
-            if (std::regex_search(t->name, filter)) {
-                matches_filter = true;
-                break;
-            }
-        }
-    }
+    const struct ggml_tensor * src0 = t->src[0];
+    const struct ggml_tensor * src1 = t->src[1];
 
     char src1_str[128] = { 0 };
     if (src1) {
         snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name, common_ggml_ne_string(src1).c_str());
     }
 
-    if (matches_filter) {
+    if (matches_filter && !pimpl->dump_only) {
         LOG("%s: %24s = (%s) %10s(%s{%s}, %s}) = {%s}\n", __func__, t->name, ggml_type_name(t->type),
             ggml_op_desc(t), src0->name, common_ggml_ne_string(src0).c_str(), src1 ? src1_str : "",
             common_ggml_ne_string(t).c_str());
@@ -181,9 +248,12 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
     }
 
-    if (!ggml_is_quantized(t->type) && matches_filter) {
+    if (matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        common_debug_dump_tensor(t, data, ggml_nbytes(t), *pimpl);
+        if (!ggml_is_quantized(t->type) && !pimpl->dump_only) {
+            common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        }
     }
 
     return true;

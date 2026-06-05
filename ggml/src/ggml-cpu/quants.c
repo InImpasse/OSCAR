@@ -125,9 +125,9 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 //===================================== Dot products =================================
 
 // Lloyd-Max 4-level centroids for N(0,σ): multiply by per-block sigma at runtime.
-static const float Q2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+static const float Q2_LM_CENTROIDS[4] = {Q2_0_LM_C0, Q2_0_LM_C1, Q2_0_LM_C2, Q2_0_LM_C3};
 // Decision thresholds (×σ): -0.6745, 0, +0.6745
-#define Q2_0_HAD_SIZE 128
+#define Q2_0_HAD_SIZE Q2_0_OWHT_GROUP_SIZE
 
 // Full-head OWHT with optional AVX2 acceleration for stages h≥8.
 // Scalar for h=1,2,4 (intra-group shuffles needed); AVX2 for h≥8 (pure add/sub).

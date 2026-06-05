@@ -145,7 +145,7 @@ llama_kv_cache::llama_kv_cache(
         n_kv_recent = env_recent ? (uint32_t)atoi(env_recent) : 0;
         n_hp_total  = n_kv_sink + n_kv_recent;
         if (n_hp_total > 0) {
-            LLAMA_LOG_INFO("%s: HP prefix+recent buffer: sink=%u, recent=%u, total=%u (Q8_0)\n",
+            LLAMA_LOG_INFO("%s: HP prefix+recent buffer: sink=%u, recent=%u, total=%u (F16)\n",
                     __func__, n_kv_sink, n_kv_recent, n_hp_total);
         }
     }
@@ -248,7 +248,7 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
-        // HP buffer: Q8_0, small (n_hp_total slots)
+        // HP buffer: F16, small (n_hp_total slots)
         ggml_tensor * k_hp = nullptr;
         ggml_tensor * v_hp = nullptr;
         std::vector<ggml_tensor *> k_hp_stream;
@@ -940,10 +940,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     slot_info res = {
-        /*.s0   =*/ LLAMA_MAX_SEQ,
-        /*.s1   =*/ 0,
-        /*.strm =*/ { },
-        /*.idxs =*/ { },
+        /*.s0            =*/ LLAMA_MAX_SEQ,
+        /*.s1            =*/ 0,
+        /*.strm          =*/ { },
+        /*.idxs          =*/ { },
+        /*.hp_idxs       =*/ { },
+        /*.hp_batch_idxs =*/ { },
     };
 
     res.resize(n_seqs);
@@ -1252,6 +1254,17 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+    }
+
+    return result;
+}
+
+uint32_t llama_kv_cache::get_n_kv_used(const slot_info & sinfo) const {
+    uint32_t result = 0;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+        result = std::max(cells.used_max_p1(), result);
     }
 
     return result;
@@ -1632,11 +1645,13 @@ ggml_tensor * llama_kv_cache::build_input_hp_batch_idxs(ggml_context * ctx, uint
     return t;
 }
 
-ggml_tensor * llama_kv_cache::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
+ggml_tensor * llama_kv_cache::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch, uint32_t n_hp_kv) const {
     if (n_hp_total == 0) return nullptr;
     const uint32_t ns    = n_stream;
     const uint32_t n_tps = ubatch.n_tokens / ns;
-    auto * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_hp_total, n_tps, 1, ns);
+    n_hp_kv = std::min(n_hp_kv, n_hp_total);
+    if (n_hp_kv == 0) return nullptr;
+    auto * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_hp_kv, n_tps, 1, ns);
     ggml_set_input(t);
     ggml_set_name(t, "hp_kq_mask");
     return t;
@@ -1674,12 +1689,12 @@ void llama_kv_cache::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const uint32_t ns    = n_stream;
-    const uint32_t n_tps = ubatch->n_tokens / ns;
+    const uint32_t ns      = n_stream;
+    const uint32_t n_tps   = ubatch->n_tokens / ns;
+    const uint32_t n_hp_kv = std::min<uint32_t>(dst->ne[0], n_hp_total);
 
     for (uint32_t s = 0; s < ns; ++s) {
         const auto & hp_cells   = v_hp_cells[s];
-        const uint32_t n_hp_kv  = n_hp_total;
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i       = s*n_tps + ii;
             const llama_pos p1     = ubatch->pos[i];
@@ -1915,7 +1930,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool exclude_hp) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1941,7 +1956,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
-        /*.hp_positions     =*/ n_hp_total > 0 ? &hp_positions : nullptr,
+        /*.hp_positions     =*/ exclude_hp && n_hp_total > 0 ? &hp_positions : nullptr,
     };
 
     if (causal_attn) {
@@ -2743,6 +2758,11 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_n_kv_used() const {
+    if (!kv) return 0;
+    return kv->get_n_kv_used(sinfos[i_cur]);
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2803,8 +2823,8 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool exclude_hp) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, exclude_hp);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2845,12 +2865,13 @@ uint32_t llama_kv_cache_context::get_n_hp_batch() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_hp(ggml_context * ctx, int32_t il) const {
-    // always expose the full HP buffer — empty slots are masked via hp_kq_mask (-inf)
-    return kv->get_k_hp(ctx, il, kv->get_n_hp(), sinfos[i_cur]);
+    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    return kv->get_k_hp(ctx, il, n_hp_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v_hp(ggml_context * ctx, int32_t il) const {
-    return kv->get_v_hp(ctx, il, kv->get_n_hp(), sinfos[i_cur]);
+    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    return kv->get_v_hp(ctx, il, n_hp_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_hp_k_idxs(ggml_context * ctx) const {
@@ -2865,11 +2886,13 @@ ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx)
     if (ubatches.empty()) {
         return nullptr;
     }
-    return kv->build_input_hp_kq_mask(ctx, ubatches[i_cur]);
+    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    return kv->build_input_hp_kq_mask(ctx, ubatches[i_cur], n_hp_kv);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    return kv->build_input_hp_kq_mask(ctx, ubatch);
+    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    return kv->build_input_hp_kq_mask(ctx, ubatch, n_hp_kv);
 }
 
 void llama_kv_cache_context::set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

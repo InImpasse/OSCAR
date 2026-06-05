@@ -446,6 +446,15 @@ void dequantize_q4_1_t4(device const block_q4_1 * xb, short il, thread type4 & r
     }
 }
 
+static inline float q2_0_centroid(uint8_t q) {
+    switch (q & 0x03) {
+        case 0:  return Q2_0_LM_C0;
+        case 1:  return Q2_0_LM_C1;
+        case 2:  return Q2_0_LM_C2;
+        default: return Q2_0_LM_C3;
+    }
+}
+
 template <typename type4x4>
 void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
     // il selects which half of the 32-element block (0 = first 16, 1 = second 16)
@@ -458,10 +467,10 @@ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & re
 
     for (int i = 0; i < 4; i++) {  // 4 bytes, each with 4 2-bit values
         const uint8_t b = qs[i];
-        reg_f[i][0] = m + d * (float)((b     ) & 0x03);
-        reg_f[i][1] = m + d * (float)((b >> 2) & 0x03);
-        reg_f[i][2] = m + d * (float)((b >> 4) & 0x03);
-        reg_f[i][3] = m + d * (float)((b >> 6) & 0x03);
+        reg_f[i][0] = m + d * q2_0_centroid((b     ) & 0x03);
+        reg_f[i][1] = m + d * q2_0_centroid((b >> 2) & 0x03);
+        reg_f[i][2] = m + d * q2_0_centroid((b >> 4) & 0x03);
+        reg_f[i][3] = m + d * q2_0_centroid((b >> 6) & 0x03);
     }
 
     reg = (type4x4) reg_f;
@@ -474,10 +483,10 @@ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & r
     const float d = xb->d;
     const float m = xb->m;
     const uint8_t b = qs[il];
-    reg[0] = m + d * (float)((b     ) & 0x03);
-    reg[1] = m + d * (float)((b >> 2) & 0x03);
-    reg[2] = m + d * (float)((b >> 4) & 0x03);
-    reg[3] = m + d * (float)((b >> 6) & 0x03);
+    reg[0] = m + d * q2_0_centroid((b     ) & 0x03);
+    reg[1] = m + d * q2_0_centroid((b >> 2) & 0x03);
+    reg[2] = m + d * q2_0_centroid((b >> 4) & 0x03);
+    reg[3] = m + d * q2_0_centroid((b >> 6) & 0x03);
 }
 
 template <typename type4x4>

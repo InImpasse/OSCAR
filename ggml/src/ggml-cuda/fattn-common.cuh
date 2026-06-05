@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "q2_0.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -131,6 +132,35 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         sum += __half2float(K_q4_0[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_0 * K_q2_0 = (const block_q2_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int k0 = k_KQ * int(sizeof(int));
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int8_t * uq = (const int8_t *) &u;
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+#pragma unroll
+        for (int l = 0; l < int(sizeof(int)); ++l) {
+            const int k = k0 + l;
+            const float kval = q2_0_dequantize_scalar_cuda(K_q2_0, k);
+            sum += kval * (uq[l] * Q_ds.x);
+        }
     }
 
     return sum;
@@ -335,7 +365,8 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_f16(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     if constexpr (std::is_same_v<T, half>) {
         ggml_cuda_memcpy_1<ne*sizeof(half)>(dst, (const half *) vx + i0);
     } else if constexpr (std::is_same_v<T, float>) {
@@ -353,7 +384,8 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_bf16(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     static_assert(std::is_same_v<T, float>, "BF16 V dequantization only supports float output");
     static_assert(ne % 2 == 0, "bad ne");
     __align__(16) nv_bfloat162 tmp[ne/2];
@@ -366,7 +398,8 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q4_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
     const int64_t ib    =  i0          /  QK4_0;
@@ -405,7 +438,39 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q2_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        static_assert(ne % 2 == 0, "bad ne");
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            float vals[2];
+#pragma unroll
+            for (int l = 0; l < 2; ++l) {
+                const int64_t i = i0 + l0 + l;
+                vals[l] = q2_0_dequantize_scalar_cuda(x, i);
+            }
+            ((half2 *) dst)[l0/2] = make_half2(vals[0], vals[1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int64_t i = i0 + l;
+            ((float *) dst)[l] = q2_0_dequantize_scalar_cuda(x, i);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q4_1(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
     const int64_t ib    =  i0          /  QK4_1;
@@ -445,7 +510,8 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
     const int64_t ib    =  i0          /  QK5_0;
@@ -495,7 +561,8 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_1(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q5_1 * x = (const block_q5_1 *) vx;
 
     const int64_t ib    =  i0          /  QK5_1;
@@ -545,7 +612,8 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q8_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
     const int64_t ib  = i0 / QK8_0;
@@ -581,6 +649,8 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_0) {
+        return vec_dot_fattn_vec_KQ_q2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -603,6 +673,8 @@ template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q2_0) {
+        return dequantize_V_q2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_1) {

@@ -54,21 +54,21 @@ static void ortho_hadamard_f32(float * GGML_RESTRICT x, int n) {
 
 // Lloyd-Max optimal 4-level centroids for N(0,1) (reconstruction levels).
 // Decision thresholds: -0.6745σ, 0, +0.6745σ.
-static const float LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+static const float LM_CENTROIDS[4] = {Q2_0_LM_C0, Q2_0_LM_C1, Q2_0_LM_C2, Q2_0_LM_C3};
 
 // Quantize one value to a 2-bit Lloyd-Max code against per-block sigma.
 static inline uint8_t lm_quantize(float v, float inv_sigma) {
     float vs = v * inv_sigma;
-    if (vs < -0.6745f) return 0;
-    if (vs <  0.0f)    return 1;
-    if (vs <  0.6745f) return 2;
+    if (vs < Q2_0_LM_T0) return 0;
+    if (vs < Q2_0_LM_T1) return 1;
+    if (vs < Q2_0_LM_T2) return 2;
     return 3;
 }
 
-// Full head-vector OWHT size: apply Hadamard to the entire head dimension
-// (128 for Qwen3-4B) so outliers spread across all dims before per-block
-// Lloyd-Max quantization. Falls back to QK2_0=32 if k < HAD_SIZE.
-#define Q2_0_HAD_SIZE 128
+// Full head-vector OWHT size: apply Hadamard to the common 128-wide head group
+// so outliers spread across dims before per-block Lloyd-Max quantization.
+// Falls back to QK2_0=32 if k < the OWHT group size.
+#define Q2_0_HAD_SIZE Q2_0_OWHT_GROUP_SIZE
 
 // OSCAR outlier clip: clamp each rotated head-vector to the clip_ratio percentile
 // of |value| (matches sglang SGLANG_OSCAR_*_CLIP_RATIO; K=0.96, V=0.92). One shared

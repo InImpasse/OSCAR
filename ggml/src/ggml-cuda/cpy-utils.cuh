@@ -2,6 +2,7 @@
 
 #include "ggml-common.h"
 #include "convert.cuh"
+#include "q2_0.cuh"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -40,6 +41,35 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
 
         y->qs[j]  = xi0;
         y->qs[j] |= xi1 << 4;
+    }
+}
+
+static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, block_q2_0 * __restrict__ y) {
+    float mean = 0.0f;
+    for (int j = 0; j < QK2_0; ++j) {
+        mean += x[j];
+    }
+    mean /= QK2_0;
+
+    float sum_sq = 0.0f;
+
+    for (int j = 0; j < QK2_0; ++j) {
+        const float v = x[j] - mean;
+        sum_sq += v * v;
+    }
+
+    const float sigma    = sqrtf(sum_sq / QK2_0);
+    const float inv_sigma = sigma > 1e-8f ? 1.0f / sigma : 0.0f;
+
+    y->d = sigma;
+    y->m = mean;
+
+    for (int j = 0; j < QK2_0 / 4; ++j) {
+        uint8_t packed = 0;
+        for (int b = 0; b < 4; ++b) {
+            packed |= q2_0_quantize_lm_cuda(x[j * 4 + b] - mean, inv_sigma) << (2 * b);
+        }
+        y->qs[j] = packed;
     }
 }
 
@@ -189,6 +219,10 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q2_0(const char * cxi, char * cdsti) {
+    quantize_f32_q2_0_block((const float *)cxi, (block_q2_0 *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_q4_1(const char * cxi, char * cdsti) {

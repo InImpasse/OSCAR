@@ -167,6 +167,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv_used(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -217,7 +218,7 @@ public:
     // HP input tensors (non-null only when n_hp_total > 0 and there are HP tokens in the batch)
     ggml_tensor * build_input_hp_k_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
     ggml_tensor * build_input_hp_batch_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
-    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch, uint32_t n_hp_kv) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -228,7 +229,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool exclude_hp = true) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -246,8 +247,8 @@ private:
         ggml_tensor * k;     // LP: type_k (e.g. Q2_0)
         ggml_tensor * v;     // LP: type_v
 
-        ggml_tensor * k_hp = nullptr;  // HP: Q8_0, size = n_hp_total (null if HP disabled)
-        ggml_tensor * v_hp = nullptr;  // HP: Q8_0
+        ggml_tensor * k_hp = nullptr;  // HP: F16, size = n_hp_total (null if HP disabled)
+        ggml_tensor * v_hp = nullptr;  // HP: F16
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -283,7 +284,7 @@ private:
 
     // OSCAR-style HP (high-precision) sink+recent buffer
     // env: LLAMA_KV_HP_SINK, LLAMA_KV_HP_RECENT
-    // sink tokens (pos < n_kv_sink) and recent tokens (latest n_kv_recent) are kept in Q8_0
+    // sink tokens (pos < n_kv_sink) and recent tokens (latest n_kv_recent) are kept in F16
     // all other tokens use the main LP (e.g. Q2_0) cache
     uint32_t n_kv_sink   = 0;  // # permanent sink tokens in HP
     uint32_t n_kv_recent = 0;  // # recent tokens in HP ring buffer
@@ -395,6 +396,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_used() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -447,7 +449,7 @@ public:
     void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool exclude_hp = true) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

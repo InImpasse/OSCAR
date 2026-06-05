@@ -2208,7 +2208,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    // OSCAR HP KV cache builds an explicit LP+HP attention graph with extra
+    // score/mask concat, split views, and value contribution nodes per layer.
+    // The previous generic estimate can run out of graph metadata before the
+    // scheduler has a chance to reserve backend buffers.
+    uint32_t res = std::max<uint32_t>(1024u, 16u*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }

@@ -453,7 +453,9 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, hp_kq_mask != nullptr);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -491,9 +493,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         const uint32_t n_hp_batch_cur = mctx->get_n_hp_batch();
         const bool had_hp = hp_k_idxs != nullptr;
         const bool has_hp_now = n_hp_batch_cur > 0;
+        const bool has_hp_attn_now = has_hp_now && mctx->get_n_hp_kv() > 0 && params.ubatch.n_tokens <= 2*params.ubatch.n_seqs_unq;
         if (had_hp != has_hp_now) {
             res = false;
         } else if (had_hp && hp_k_idxs->ne[0] != (int64_t)n_hp_batch_cur) {
+            res = false;
+        } else if ((hp_kq_mask != nullptr) != has_hp_attn_now) {
             res = false;
         }
     }
@@ -2208,15 +2213,17 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    // HP sink+recent buffers (works regardless of flash_attn)
-    // Use the scheduling ubatch (from the outer call) for HP mask sizing,
-    // matching how build_attn_inp_kq_mask uses it for the LP mask.
-    if (mctx_cur->has_hp()) {
+    // HP sink+recent writes are independent from HP attention. During prompt
+    // processing, keep filling HP but use the normal q2 FA path; enable the
+    // LP+HP joint attention graph for generation-sized batches.
+    if (mctx_cur->has_hp() && mctx_cur->get_n_hp_batch() > 0) {
         inp->hp_k_idxs     = mctx_cur->build_input_hp_k_idxs(ctx0);
         inp->hp_batch_idxs = mctx_cur->build_input_hp_batch_idxs(ctx0);
-        inp->hp_kq_mask    = mctx_cur->build_input_hp_kq_mask(ctx0, ubatch);
-        if (inp->hp_kq_mask) {
-            inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+        if (mctx_cur->get_n_hp_kv() > 0 && ubatch.n_tokens <= 2*ubatch.n_seqs_unq) {
+            inp->hp_kq_mask = mctx_cur->build_input_hp_kq_mask(ctx0, ubatch);
+            if (inp->hp_kq_mask) {
+                inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+            }
         }
     }
 
@@ -2289,15 +2296,47 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (mctx_cur->has_hp() && inp->hp_kq_mask) {
         // Exact LP+HP attention via concatenated softmax (non-FA path):
-        //   LP tokens (middle, Q2_0 KV) and HP tokens (sink+recent, F16 KV) are handled
-        //   by computing their attention scores separately, concatenating along the KV
-        //   dimension, applying a joint softmax with a combined mask, then summing the
-        //   weighted value contributions from each tier.  This avoids the softmax-merge
-        //   problem of a naive two-pass FA approach.
+        //   LP (e.g. Q2_0) and HP (e.g. F16) keys may differ in type — then K·Q uses two
+        //   mul_mats plus concat; when LP/HP K share a type, concat K on the sequence axis
+        //   and use one mul_mat.  Joint softmax on the combined KV axis avoids the naive
+        //   two-pass FA merge bug.  Keep kq_all as-is after softmax; only materialize
+        //   the HP weight view below because making all scores contiguous is too costly
+        //   at long context.
 
         ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
         ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
 
+        // If sink+recent HP already covers the whole visible KV range, the LP
+        // side is fully masked.  Use the HP f16 cache directly and avoid doing
+        // q2 KQ work that would be discarded by the mask.
+        if (mctx_cur->get_n_hp_kv() >= mctx_cur->get_n_kv_used()) {
+            cur = build_attn_mha(q, k_hp, v_hp, nullptr, inp->hp_kq_mask_cnv, nullptr, nullptr, kq_scale, il);
+            cb(cur, "kqv_hp_only", il);
+        } else if (!getenv("LLAMA_KV_HP_NO_FUSED_Q2_0") &&
+                   !getenv("LLAMA_KV_HP_NO_FUSED_Q2") &&
+                   cparams.flash_attn &&
+                   hparams.f_max_alibi_bias == 0.0f &&
+                   hparams.f_attn_logit_softcapping == 0.0f &&
+                   k->type == GGML_TYPE_Q2_0 &&
+                   v->type == GGML_TYPE_Q2_0 &&
+                   k_hp->type == GGML_TYPE_F16 &&
+                   v_hp->type == GGML_TYPE_F16) {
+            const int64_t n_stream = k->ne[3];
+
+            ggml_tensor * q_fused = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                                 q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+            q_fused = ggml_permute(ctx0, q_fused, 0, 2, 1, 3);
+
+            ggml_tensor * k_lp_fused = ggml_permute(ctx0, k,    0, 2, 1, 3);
+            ggml_tensor * v_lp_fused = ggml_permute(ctx0, v,    0, 2, 1, 3);
+            ggml_tensor * k_hp_fused = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+            ggml_tensor * v_hp_fused = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+            cur = ggml_flash_attn_ext_q2_0_f16(ctx0, q_fused, k_lp_fused, v_lp_fused, inp->self_kq_mask,
+                                            k_hp_fused, v_hp_fused, inp->hp_kq_mask, kq_scale);
+            cb(cur, "fattn_q2_0_f16", il);
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        } else {
         const int64_t n_stream = k->ne[3];   // k: [n_embd_head_k, n_head_kv, n_kv, n_stream]
 
         // Permute q: [n_embd_head_q, n_head_q, n_tokens] → [n_embd_head_q, n_tok_per_stream, n_head_q, n_stream]
@@ -2309,16 +2348,24 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
         ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
 
-        // LP attention scores [n_kv, n_tok_per_stream, n_head_q, n_stream]
-        ggml_tensor * kq_lp = ggml_mul_mat(ctx0, k_lp_p, q_perm);
-        ggml_mul_mat_set_prec(kq_lp, GGML_PREC_F32);
+        ggml_tensor * kq_all;
+        if (k->type == k_hp->type) {
+            // One batched K·Q matmul when LP/HP keys share the same element type (e.g. both F16).
+            ggml_tensor * k_cat = ggml_concat(ctx0, k_lp_p, k_hp_p, 1);
+            kq_all = ggml_mul_mat(ctx0, k_cat, q_perm);
+            ggml_mul_mat_set_prec(kq_all, GGML_PREC_F32);
+        } else {
+            // LP attention scores [n_kv, n_tok_per_stream, n_head_q, n_stream]
+            ggml_tensor * kq_lp = ggml_mul_mat(ctx0, k_lp_p, q_perm);
+            ggml_mul_mat_set_prec(kq_lp, GGML_PREC_F32);
 
-        // HP attention scores [n_hp_total, n_tok_per_stream, n_head_q, n_stream]
-        ggml_tensor * kq_hp = ggml_mul_mat(ctx0, k_hp_p, q_perm);
-        ggml_mul_mat_set_prec(kq_hp, GGML_PREC_F32);
+            // HP attention scores [n_hp_total, n_tok_per_stream, n_head_q, n_stream]
+            ggml_tensor * kq_hp = ggml_mul_mat(ctx0, k_hp_p, q_perm);
+            ggml_mul_mat_set_prec(kq_hp, GGML_PREC_F32);
 
-        // Concatenate scores along KV dim → [n_kv + n_hp_total, n_tok_per_stream, n_head_q, n_stream]
-        ggml_tensor * kq_all = ggml_concat(ctx0, kq_lp, kq_hp, 0);
+            // Concatenate scores along KV dim → [n_kv + n_hp_total, n_tok_per_stream, n_head_q, n_stream]
+            kq_all = ggml_concat(ctx0, kq_lp, kq_hp, 0);
+        }
 
         // Concatenate LP and HP masks (both F32 [n_kv/n_hp, n_tok_per_stream, 1, n_stream])
         // LP mask has HP positions set to -inf; HP mask has empty slots set to -inf
@@ -2362,6 +2409,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kqv = ggml_add(ctx0, vkq_lp, vkq_hp);
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        }
     } else {
         cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     }

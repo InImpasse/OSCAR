@@ -45,6 +45,10 @@ void llama_model_granite::load_arch_tensors(llama_model_loader &) {
         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
 
+        // OSCAR calibrated K/V rotations (per-layer [head_dim, head_dim]); optional — bake via oscar-rotation/export_rot_kv_gguf.py
+        layer.attn_k_rot = create_tensor(tn(LLM_TENSOR_ATTN_K_ROT, "weight", i), {n_embd_head_k, n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        layer.attn_v_rot = create_tensor(tn(LLM_TENSOR_ATTN_V_ROT, "weight", i), {n_embd_head_k, n_embd_head_k}, TENSOR_NOT_REQUIRED);
+
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
 
@@ -186,11 +190,36 @@ ggml_tensor * llama_model_granite::graph::build_attention_layer(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    // OSCAR optional calibrated rotation (post-RoPE): aligns with qwen3.cpp (Q/K same M_k; V store with M_v, undo before W_o)
+    if (model.layers[il].attn_k_rot) {
+        Qcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Qcur);
+        Kcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Kcur);
+        cb(Qcur, "Qcur_rot", il);
+        cb(Kcur, "Kcur_rot", il);
+    }
+
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-    cur = build_attn(inp_attn,
-            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-            cb(cur, "attn_out", il);
+
+    if (model.layers[il].attn_v_rot) {
+        Vcur = ggml_mul_mat(ctx0, model.layers[il].attn_v_rot, Vcur);
+        cb(Vcur, "Vcur_rot", il);
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        ggml_tensor * Mv = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].attn_v_rot));
+        cur = ggml_reshape_3d(ctx0, cur, n_embd_head, hparams.n_head(il), cur->ne[1]);
+        cur = ggml_mul_mat(ctx0, Mv, cur);
+        cur = ggml_cont_2d(ctx0, cur, n_embd_head * hparams.n_head(il), cur->ne[2]);
+        cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+        if (model.layers[il].wo_b) {
+            cur = ggml_add(ctx0, cur, model.layers[il].wo_b);
+        }
+    } else {
+        cur = build_attn(inp_attn,
+                model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
+    cb(cur, "attn_out", il);
     return cur;
 }
 

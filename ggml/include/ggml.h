@@ -556,6 +556,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_Q2_0_F16,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2416,6 +2417,17 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_q2_0_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_lp,
+            struct ggml_tensor  * v_lp,
+            struct ggml_tensor  * mask_lp,
+            struct ggml_tensor  * k_hp,
+            struct ggml_tensor  * v_hp,
+            struct ggml_tensor  * mask_hp,
+            float                 scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

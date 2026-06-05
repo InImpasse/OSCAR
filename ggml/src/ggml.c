@@ -1059,6 +1059,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_Q2_0_F16",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1088,7 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1169,6 +1170,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_q2_0_f16(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1198,7 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5411,6 +5413,48 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_q2_0_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_lp,
+        struct ggml_tensor  * v_lp,
+        struct ggml_tensor  * mask_lp,
+        struct ggml_tensor  * k_hp,
+        struct ggml_tensor  * v_hp,
+        struct ggml_tensor  * mask_hp,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_lp->type == GGML_TYPE_Q2_0);
+    GGML_ASSERT(v_lp->type == GGML_TYPE_Q2_0);
+    GGML_ASSERT(k_hp->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_hp->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask_lp->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask_hp->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(q->ne[0] == k_lp->ne[0]);
+    GGML_ASSERT(q->ne[0] == v_lp->ne[0]);
+    GGML_ASSERT(q->ne[0] == k_hp->ne[0]);
+    GGML_ASSERT(q->ne[0] == v_hp->ne[0]);
+    GGML_ASSERT(q->ne[3] == k_lp->ne[3]);
+    GGML_ASSERT(q->ne[3] == k_hp->ne[3]);
+
+    int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params(result, &scale, sizeof(scale));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_Q2_0_F16;
+    result->src[0] = q;
+    result->src[1] = k_lp;
+    result->src[2] = v_lp;
+    result->src[3] = mask_lp;
+    result->src[4] = k_hp;
+    result->src[5] = v_hp;
+    result->src[6] = mask_hp;
+
+    return result;
 }
 
 // ggml_flash_attn_back
