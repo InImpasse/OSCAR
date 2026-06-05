@@ -1,6 +1,35 @@
 .omc/
 .RUD/
 
+# Local build trees
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake / compile artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+Makefile
+compile_commands.json
+*.a
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.bin
+*.ptx
+*.cubin
+*.fatbin
+*.log
+
 # rotation pipeline artifacts (dump tensors, computed rotation .pt, eval logs).
 # Per-model: track only the .sh / .py source under rotation/<model>/; exclude
 # every kind of generated calibration / eval / investigation byproduct.
