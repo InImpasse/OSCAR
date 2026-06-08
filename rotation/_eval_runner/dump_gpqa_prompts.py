@@ -24,7 +24,7 @@ import os
 import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,7 +54,15 @@ def _build_argparser():
     p.add_argument("--num-prompts", type=int, default=198,
                    help="how many GPQA prompts to send (sequence_lens budget on "
                    "the server side will auto-stop the dump hook before this).")
-    p.add_argument("--num-threads", type=int, default=32)
+    p.add_argument(
+        "--num-threads",
+        type=int,
+        default=1,
+        help=(
+            "Number of concurrent requests. QKV dumping synchronizes CUDA and "
+            "writes tensors for every layer, so the stable default is 1."
+        ),
+    )
     p.add_argument("--temperature", type=float, default=0.6,
                    help="Sampling temperature (unused because max_tokens=1, "
                         "but kept for API compatibility).")
@@ -65,6 +73,23 @@ def _build_argparser():
     p.add_argument("--api", choices=("chat", "completions"), default="chat",
                    help="Use completions for base models without a chat_template.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--dump-dir",
+        default=os.environ.get("DUMP_KVCACHE_DIR"),
+        help="QKV dump directory. Defaults to DUMP_KVCACHE_DIR.",
+    )
+    p.add_argument(
+        "--dump-token-budget",
+        type=int,
+        default=int(os.environ.get("DUMP_KVCACHE_TOKENS", "0") or "0"),
+        help="Stop submitting prompts once layer_0 seq_lens reaches this token budget.",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.25,
+        help="Sleep between sequential dump requests.",
+    )
     return p
 
 
@@ -119,10 +144,37 @@ def _send_one(client, model, prompt, temperature, top_p, top_k, max_tokens, api)
         return f"err: {e!r}"
 
 
+def _dumped_tokens(dump_dir, layer_id=0):
+    if not dump_dir:
+        return 0
+    seq_dir = Path(dump_dir) / f"layer_{layer_id}" / "seq_lens"
+    if not seq_dir.is_dir():
+        return 0
+    try:
+        import torch
+    except Exception:
+        return 0
+
+    total = 0
+    for path in sorted(seq_dir.glob("*.pt"), key=lambda p: int(p.stem)):
+        try:
+            seq_lens = torch.load(path, weights_only=True, map_location="cpu")
+            total += int(seq_lens.sum().item())
+        except Exception:
+            continue
+    return total
+
+
+def _budget_reached(args):
+    if args.dump_token_budget <= 0:
+        return False
+    return _dumped_tokens(args.dump_dir) >= args.dump_token_budget
+
+
 def main():
     args = _build_argparser().parse_args()
     from openai import OpenAI
-    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+    client = OpenAI(base_url=args.base_url, api_key=args.api_key, max_retries=0)
 
     prompts = _build_prompts(args.num_prompts, args.variant, args.seed)
     print(f"[dump] sending {len(prompts)} GPQA-{args.variant} prompts at "
@@ -130,24 +182,85 @@ def main():
           "controls when the dump hook stops)", flush=True)
 
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
-        futs = [
-            ex.submit(_send_one, client, args.model, p,
-                      args.temperature, args.top_p, args.top_k, args.max_tokens,
-                      args.api)
-            for p in prompts
-        ]
+    submitted = 0
+    if args.num_threads <= 1:
         n_ok = n_err = 0
-        for i, f in enumerate(as_completed(futs)):
-            r = f.result()
+        for i, prompt in enumerate(prompts):
+            if _budget_reached(args):
+                print(
+                    f"[dump] token budget reached before prompt {i}; "
+                    f"dumped_tokens={_dumped_tokens(args.dump_dir)}",
+                    flush=True,
+                )
+                break
+            submitted += 1
+            r = _send_one(
+                client,
+                args.model,
+                prompt,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.max_tokens,
+                args.api,
+            )
             if r == "ok":
                 n_ok += 1
             else:
                 n_err += 1
                 if n_err <= 5:
                     print(f"  prompt {i}: {r}", flush=True)
-    print(f"[dump] done in {time.time()-t0:.1f}s  ok={n_ok}  err={n_err}",
-          flush=True)
+            if args.poll_interval > 0:
+                time.sleep(args.poll_interval)
+    else:
+        n_ok = n_err = 0
+        prompt_iter = iter(enumerate(prompts))
+        pending = {}
+        with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
+            while True:
+                while len(pending) < args.num_threads and not _budget_reached(args):
+                    try:
+                        i, prompt = next(prompt_iter)
+                    except StopIteration:
+                        break
+                    fut = ex.submit(
+                        _send_one,
+                        client,
+                        args.model,
+                        prompt,
+                        args.temperature,
+                        args.top_p,
+                        args.top_k,
+                        args.max_tokens,
+                        args.api,
+                    )
+                    pending[fut] = i
+                    submitted += 1
+                if not pending:
+                    break
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    i = pending.pop(fut)
+                    r = fut.result()
+                    if r == "ok":
+                        n_ok += 1
+                    else:
+                        n_err += 1
+                        if n_err <= 5:
+                            print(f"  prompt {i}: {r}", flush=True)
+                if _budget_reached(args):
+                    print(
+                        f"[dump] token budget reached; "
+                        f"dumped_tokens={_dumped_tokens(args.dump_dir)}",
+                        flush=True,
+                    )
+                    break
+    dumped = _dumped_tokens(args.dump_dir)
+    print(
+        f"[dump] done in {time.time()-t0:.1f}s  submitted={submitted} "
+        f"ok={n_ok}  err={n_err}  dumped_tokens={dumped}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

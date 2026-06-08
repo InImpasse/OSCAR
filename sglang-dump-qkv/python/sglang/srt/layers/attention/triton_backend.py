@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import atexit
 import math
 import os
+import queue
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -70,6 +73,85 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
 
 
+class _AsyncKvDumpWriter:
+    def __init__(self):
+        max_queue_size = max(1, get_int_env_var("SGLANG_DUMP_KVCACHE_ASYNC_QUEUE", 64))
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        self._stop = object()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="sglang-kv-dump-writer",
+            daemon=True,
+        )
+        self._thread.start()
+        atexit.register(self.close)
+
+    def submit(
+        self,
+        save_dir: str,
+        layer_id: int,
+        chunk_idx: int,
+        q_dump: torch.Tensor,
+        k_dump: torch.Tensor,
+        v_dump: torch.Tensor,
+        chunk_seq_lens_t: torch.Tensor,
+        event: Optional[torch.cuda.Event],
+    ) -> None:
+        self._queue.put(
+            (
+                save_dir,
+                layer_id,
+                chunk_idx,
+                q_dump,
+                k_dump,
+                v_dump,
+                chunk_seq_lens_t,
+                event,
+            )
+        )
+
+    def close(self) -> None:
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.is_alive():
+            return
+        self._queue.put(self._stop)
+        thread.join()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._stop:
+                self._queue.task_done()
+                break
+            try:
+                (
+                    save_dir,
+                    layer_id,
+                    chunk_idx,
+                    q_dump,
+                    k_dump,
+                    v_dump,
+                    chunk_seq_lens_t,
+                    event,
+                ) = item
+                if event is not None:
+                    event.synchronize()
+                for name, tensor in [
+                    ("q", q_dump),
+                    ("k", k_dump),
+                    ("v", v_dump),
+                ]:
+                    chunk_dir = os.path.join(save_dir, f"layer_{layer_id}", name)
+                    os.makedirs(chunk_dir, exist_ok=True)
+                    path = os.path.join(chunk_dir, f"{chunk_idx}.pt")
+                    torch.save(tensor, path)
+                seq_dir = os.path.join(save_dir, f"layer_{layer_id}", "seq_lens")
+                os.makedirs(seq_dir, exist_ok=True)
+                torch.save(chunk_seq_lens_t, os.path.join(seq_dir, f"{chunk_idx}.pt"))
+            finally:
+                self._queue.task_done()
+
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -114,6 +196,7 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        self._async_kv_dump_writer = None
         self._dump_kv_done_layers = set()
         self._dump_saved_tokens = {}
         self._dump_chunk_idx = {}
@@ -856,11 +939,6 @@ class TritonAttnBackend(AttentionBackend):
                 num_tokens = q.shape[0]
                 tokens_to_save = min(num_tokens, remaining)
 
-                if str(
-                    getattr(forward_batch.token_to_kv_pool, "device", "cuda")
-                ).startswith("cuda"):
-                    torch.cuda.synchronize()
-
                 q_dump = (
                     q[:tokens_to_save]
                     .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -894,24 +972,33 @@ class TritonAttnBackend(AttentionBackend):
 
                 if tp_rank == 0:
                     save_dir = os.environ.get("DUMP_KVCACHE_DIR", ".")
-                    for name, tensor in [
-                        ("q", q_dump),
-                        ("k", k_dump),
-                        ("v", v_dump),
-                    ]:
-                        chunk_dir = os.path.join(
-                            save_dir, f"layer_{layer_id}", name
-                        )
-                        os.makedirs(chunk_dir, exist_ok=True)
-                        path = os.path.join(chunk_dir, f"{chunk_idx}.pt")
-                        torch.save(tensor.cpu(), path)
-                    seq_dir = os.path.join(
-                        save_dir, f"layer_{layer_id}", "seq_lens"
-                    )
-                    os.makedirs(seq_dir, exist_ok=True)
-                    torch.save(
-                        chunk_seq_lens_t,
-                        os.path.join(seq_dir, f"{chunk_idx}.pt"),
+                    if self._async_kv_dump_writer is None:
+                        self._async_kv_dump_writer = _AsyncKvDumpWriter()
+
+                    if q_dump.is_cuda:
+                        q_cpu = torch.empty_like(q_dump, device="cpu", pin_memory=True)
+                        k_cpu = torch.empty_like(k_dump, device="cpu", pin_memory=True)
+                        v_cpu = torch.empty_like(v_dump, device="cpu", pin_memory=True)
+                        q_cpu.copy_(q_dump, non_blocking=True)
+                        k_cpu.copy_(k_dump, non_blocking=True)
+                        v_cpu.copy_(v_dump, non_blocking=True)
+                        event = torch.cuda.Event()
+                        event.record(torch.cuda.current_stream(q_dump.device))
+                    else:
+                        q_cpu = q_dump.cpu()
+                        k_cpu = k_dump.cpu()
+                        v_cpu = v_dump.cpu()
+                        event = None
+
+                    self._async_kv_dump_writer.submit(
+                        save_dir=save_dir,
+                        layer_id=layer_id,
+                        chunk_idx=chunk_idx,
+                        q_dump=q_cpu,
+                        k_dump=k_cpu,
+                        v_dump=v_cpu,
+                        chunk_seq_lens_t=chunk_seq_lens_t.cpu(),
+                        event=event,
                     )
                     print(
                         f"Dumped QKV chunk {chunk_idx} for layer {layer_id} "
