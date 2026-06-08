@@ -73,6 +73,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    Gemma4Config,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -113,6 +114,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     KimiLinearConfig,
     Qwen3NextConfig,
     FalconH1Config,
+    Gemma4Config,
     GraniteMoeHybridConfig,
     DotsVLMConfig,
     DotsOCRConfig,
@@ -653,6 +655,18 @@ def get_config(
 
     if model_override_args:
         config.update(model_override_args)
+
+    if (
+        getattr(config, "model_type", None) == "gemma4"
+        and getattr(config, "architectures", None) == ["Gemma4ForCausalLM"]
+    ):
+        text_config = config.text_config
+        for key, val in text_config.to_dict().items():
+            if key.startswith("_") or val is None:
+                continue
+            setattr(config, key, val)
+        config.model_type = text_config.model_type
+        config.text_config = text_config
 
     # Special architecture mapping check for GGUF models
     if is_gguf:

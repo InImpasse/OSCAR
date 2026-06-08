@@ -21,14 +21,16 @@ from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 import torch
 from torch import nn
 from transformers import (
-    Gemma4AudioConfig,
-    Gemma4Config,
-    Gemma4TextConfig,
-    Gemma4VisionConfig,
     PreTrainedModel,
 )
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.configs.gemma4 import (
+    Gemma4AudioConfig,
+    Gemma4Config,
+    Gemma4TextConfig,
+    Gemma4VisionConfig,
+)
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor

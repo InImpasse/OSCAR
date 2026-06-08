@@ -29,8 +29,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Gemma4AudioConfig
 
+from sglang.srt.configs.gemma4 import Gemma4AudioConfig
 from sglang.srt.layers.clippable_linear import (
     ClippableColumnParallelLinear,
     ClippableGLUParallelLinear,

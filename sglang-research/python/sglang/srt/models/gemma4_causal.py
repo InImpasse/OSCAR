@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 from transformers import (
-    Gemma4TextConfig,
     PretrainedConfig,
     PreTrainedModel,
 )
@@ -47,6 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
+from sglang.srt.configs.gemma4 import Gemma4TextConfig
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -903,7 +903,8 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
-        num_experts = self.config.num_experts
+        num_experts = getattr(self.config, "num_experts", None)
+        enable_moe_block = getattr(self.config, "enable_moe_block", False)
 
         k_eq_v_layers = self._get_k_eq_v_layers()
 
@@ -939,7 +940,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
-            for param_name, weight_name, shard_ids in expert_params_mapping:
+            for param_name, weight_name, shard_ids in (
+                expert_params_mapping if enable_moe_block and num_experts else []
+            ):
                 name = orig_name
                 if weight_name not in name:
                     continue

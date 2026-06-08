@@ -103,7 +103,8 @@ class MultimodalSpecialTokens:
             return token
         if isinstance(token, str):
             return token
-        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+        tokenizer = getattr(processor, "tokenizer", processor)
+        return tokenizer.convert_ids_to_tokens([token])[0]
 
     def convert_to_strs(self, processor):
         if not self.image_token:

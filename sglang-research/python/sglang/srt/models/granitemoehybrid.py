@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.models.utils import maybe_absorb_oscar_v_rotation_into_qkv
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -36,6 +37,21 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 
 from .granitemoe import GraniteMoeMoE
+
+
+def _granite_scale(tensor: torch.Tensor, multiplier: float) -> torch.Tensor:
+    """Apply Granite muP multipliers without fp16 underflow on deep residual paths."""
+    if tensor.dtype == torch.float16:
+        return (tensor.float() * multiplier).to(dtype=torch.float16)
+    return tensor * multiplier
+
+
+def _granite_residual_add(
+    residual: torch.Tensor, branch: torch.Tensor, multiplier: float
+) -> torch.Tensor:
+    if residual.dtype == torch.float16:
+        return residual + (branch.float() * multiplier).to(dtype=torch.float16)
+    return residual + branch * multiplier
 
 
 _DUMP_QKV_CHUNK_ID = 0
@@ -227,7 +243,9 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             use_triton_causal_conv=True,
         )
 
-        hidden_states = residual + output * self.residual_multiplier
+        hidden_states = _granite_residual_add(
+            residual, output, self.residual_multiplier
+        )
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -244,7 +262,9 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states = _granite_residual_add(
+            residual, hidden_states, self.residual_multiplier
+        )
 
         return hidden_states, residual
 
@@ -279,6 +299,9 @@ class GraniteMoeHybridAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_key_value_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_kv_heads = self.num_key_value_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -417,7 +440,9 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states = _granite_residual_add(
+            residual, hidden_states, self.residual_multiplier
+        )
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -434,7 +459,9 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
-        hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states = _granite_residual_add(
+            residual, hidden_states, self.residual_multiplier
+        )
 
         return hidden_states, residual
 
@@ -513,7 +540,9 @@ class GraniteMoeHybridModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-                hidden_states = hidden_states * self.embedding_multiplier
+                hidden_states = _granite_scale(
+                    hidden_states, self.embedding_multiplier
+                )
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -818,6 +847,12 @@ class GraniteMoeHybridForCausalLM(
                         loaded = True
                 if not loaded:
                     _load(n, p)
+
+        maybe_absorb_oscar_v_rotation_into_qkv(
+            self.model,
+            quant_config=self.quant_config,
+            model_label="GraniteMoeHybrid",
+        )
 
         return loaded_params
 

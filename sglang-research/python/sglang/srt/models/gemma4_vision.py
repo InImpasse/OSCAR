@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import Gemma4VisionConfig
 
+from sglang.srt.configs.gemma4 import Gemma4VisionConfig
 from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
 from sglang.srt.layers.clippable_linear import (
     ClippableGateUpParallelLinear,

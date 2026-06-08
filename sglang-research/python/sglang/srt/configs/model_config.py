@@ -185,6 +185,8 @@ class ModelConfig:
             or hasattr(self.hf_config, "vision_config")
             or hasattr(self.hf_config, "audio_config")
         )
+        if self.hf_config.architectures[0] == "Gemma4ForCausalLM":
+            has_multimodal_subconfig = False
         self.is_multimodal = enable_multimodal and (
             is_multimodal_model(self.hf_config.architectures)
             or has_multimodal_subconfig

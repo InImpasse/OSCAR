@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import maybe_absorb_oscar_v_rotation_into_qkv
 from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
 
@@ -427,6 +428,10 @@ class GraniteForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        maybe_absorb_oscar_v_rotation_into_qkv(
+            self.model, quant_config=self.quant_config, model_label="Granite"
+        )
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

@@ -506,6 +506,7 @@ def _absorb_v_dense(attn: nn.Module, R_v: torch.Tensor) -> None:
         dtype=weight.dtype
     )
     v_weight.copy_(folded_weight.reshape_as(v_weight))
+    del folded_weight
 
 
 def _absorb_v_fp8_channel(attn: nn.Module, R_v: torch.Tensor) -> None:
@@ -536,6 +537,7 @@ def _absorb_v_fp8_channel(attn: nn.Module, R_v: torch.Tensor) -> None:
 
     v_weight_fp8.copy_(requantized)
     v_scale.copy_(new_scale.to(v_scale.dtype))
+    del v_fp32, folded, new_scale, requantized
 
 
 def _absorb_v_fp8_per_tensor(attn: nn.Module, R_v: torch.Tensor) -> None:
@@ -590,6 +592,7 @@ def _absorb_v_fp8_per_tensor(attn: nn.Module, R_v: torch.Tensor) -> None:
 
     v_weight_fp8.copy_(requantized)
     weight_scale.data[2] = new_scale
+    del v_fp32, folded, requantized
 
 
 def _absorb_v_bias(attn: nn.Module, R_v: torch.Tensor) -> None:
@@ -601,6 +604,7 @@ def _absorb_v_bias(attn: nn.Module, R_v: torch.Tensor) -> None:
     v_bias_2d = v_bias.reshape(attn.num_kv_heads, attn.head_dim)
     folded_bias = torch.matmul(v_bias_2d.to(torch.float32), R_v).to(dtype=bias.dtype)
     v_bias.copy_(folded_bias.reshape_as(v_bias))
+    del folded_bias
 
 
 def maybe_absorb_oscar_v_rotation_into_qkv(
@@ -725,6 +729,10 @@ def maybe_absorb_oscar_v_rotation_into_qkv(
         _absorb_v_bias(attn, R_v)
         attn.attn.oscar_v_rotation_absorbed = True
         folded_layers += 1
+
+    del rotations
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if folded_layers == 0:
         raise RuntimeError(
