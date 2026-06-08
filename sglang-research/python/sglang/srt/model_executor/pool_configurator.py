@@ -84,6 +84,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _cap_mixed_kv_quant_tokens(max_total_num_tokens: int, page_size: int) -> int:
+    from sglang.srt.environ import envs
+
+    cap = envs.SGLANG_MIXED_KV_MAX_QUANT_TOKENS.get()
+    if cap <= 0:
+        return max_total_num_tokens
+    cap = max(cap // page_size * page_size, page_size)
+    capped = min(max_total_num_tokens, cap)
+    if capped != max_total_num_tokens:
+        logger.info(
+            "Unified mixed KV quant arena capped: max_total_num_tokens %s -> %s "
+            "(SGLANG_MIXED_KV_MAX_QUANT_TOKENS=%s)",
+            max_total_num_tokens,
+            capped,
+            cap,
+        )
+    return capped
+
+
+def _round_up_to_page(x: int, page_size: int) -> int:
+    return ((int(x) + page_size - 1) // page_size) * page_size
+
+
 def _resolve_quant_group_count(head_dim: int, group_size: Optional[int]) -> int:
     effective_group_size = head_dim if group_size is None else group_size
     if effective_group_size <= 0:
@@ -159,13 +182,12 @@ def _get_unified_mixed_kv_bytes_per_quant_token(
     v_groups: int,
     n_q: int,
 ) -> int:
-    """Shared-arena bytes per *quant token* in the unified pool.
+    """Legacy shared-arena bytes per *quant token* in the unified pool.
 
-    A page of the shared K/V arena is sized to host either 1 HP token or N_Q
-    quant tokens; its byte size is therefore ``(head_dim + v_head_dim) *
-    hp_dtype_bytes``. Per quant token that is this over ``N_Q``. Scales/zeros
-    live in a parallel arena (one entry per quant slot) and are included
-    here so the scheduler's cell-size matches the actual allocator size.
+    Kept for older callers/tests that reason about the former page-aliasing
+    model. The production unified pool now uses decoupled quant and HP arenas,
+    so ``DefaultPoolConfigurator`` uses the plain int2 quant cell size plus an
+    HP-reserve bias instead.
     """
     arena_bytes_per_page = (k_head_dim + v_head_dim) * hp_dtype_bytes
     arena_bytes_per_quant_token = arena_bytes_per_page // n_q
@@ -204,6 +226,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, mr: ModelRunner):
+        self._mixed_kv_enabled = False
+        self._mixed_kv_hp_reserve_bytes = 0
         # Determine effective number of layers for KV cache
         if mambaish := mr.mambaish_config:
             effective_layer_ids = [
@@ -266,28 +290,38 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             scale_bytes = None
 
         if enable_mixed_kv:
+            self._mixed_kv_enabled = True
             hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
             hp_dtype_bytes = torch.empty(0, dtype=hp_dtype).element_size()
             _, n_q = compute_page_geometry(hp_dtype)
-            k_groups = _resolve_quant_group_count(
-                model_config.head_dim, kv_quant_group_size
-            )
-            v_groups = _resolve_quant_group_count(
-                model_config.v_head_dim, kv_quant_group_size
-            )
-            # max_total_num_tokens is denominated in *quant tokens* (slot ids
-            # on the int2 tier). This matches the unified allocator's
-            # scheduler-facing ``size = (num_pages - 1) * N_Q``.
-            bytes_per_head = _get_unified_mixed_kv_bytes_per_quant_token(
+            bytes_per_head = _get_int_kv_bytes_per_head_pair(
                 model_config.head_dim,
                 model_config.v_head_dim,
-                hp_dtype_bytes,
+                kv_cache_dtype,
+                kv_quant_group_size,
                 scale_bytes,
-                k_groups,
-                v_groups,
-                n_q,
             )
             kv_size = None
+            max_req_slots = getattr(mr, "max_running_requests", None)
+            if max_req_slots is None:
+                max_req_slots = getattr(mr.server_args, "max_running_requests", None)
+            if max_req_slots is None:
+                max_req_slots = 1
+            p_tokens = envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
+            r_tokens = envs.SGLANG_MIXED_KV_RECENT_TOKENS.get()
+            hp_prefix_pool = envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
+            if hp_prefix_pool <= 0:
+                hp_prefix_pool = max(1024, int(max_req_slots) * int(p_tokens))
+            hp_prefix_pool = _round_up_to_page(hp_prefix_pool, n_q)
+            hp_recent_ring = int(r_tokens) + n_q - 1
+            hp_total_slots = hp_prefix_pool + int(max_req_slots) * hp_recent_ring
+            self._mixed_kv_hp_reserve_bytes = (
+                hp_total_slots
+                * model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * num_layers
+                * hp_dtype_bytes
+            )
         elif kv_cache_dtype == "int2":
             bytes_per_head = _get_int_kv_bytes_per_head_pair(
                 model_config.head_dim,
@@ -364,14 +398,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._mixed_kv_hp_reserve_bytes:
+            available_bytes -= self._mixed_kv_hp_reserve_bytes
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._mixed_kv_enabled:
+            max_total_num_tokens = _cap_mixed_kv_quant_tokens(
+                max_total_num_tokens, page_size
+            )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._mixed_kv_enabled:
+            max_total_num_tokens = _cap_mixed_kv_quant_tokens(
+                max_total_num_tokens, page_size
+            )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 

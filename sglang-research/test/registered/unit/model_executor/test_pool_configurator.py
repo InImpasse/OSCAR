@@ -46,6 +46,7 @@ def _make_model_runner(
     mambaish_config=None,
     kv_cache_dtype="fake_bf16",
     kv_cache_quant_group_size=None,
+    max_running_requests=1,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -83,7 +84,14 @@ def _make_model_runner(
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.kv_cache_quant_group_size = kv_cache_quant_group_size
+    sa.max_running_requests = max_running_requests
+    sa.attention_backend = "triton"
+    sa.prefill_attention_backend = "triton"
+    sa.decode_attention_backend = "triton"
+    sa.disaggregation_mode = "null"
+    sa.speculative_algorithm = None
     mr.server_args = sa
+    mr.max_running_requests = max_running_requests
 
     spec = MagicMock()
     spec.is_dflash.return_value = False
@@ -294,6 +302,98 @@ class TestDefaultConfigurator(unittest.TestCase):
                 expected_cell_size,
                 f"cell_size mismatch for scale_dtype={scale_name}",
             )
+
+    def test_mixed_int2_quant_tokens_are_capped_by_default(self):
+        import os
+        from unittest.mock import patch as _patch
+
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = _make_model_runner(
+            kv_cache_dtype="int2",
+            num_kv_heads=4,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=8,
+            kv_cache_quant_group_size=32,
+            page_size=8,
+        )
+        env = {
+            "SGLANG_ENABLE_MIXED_KV_WINDOWS": "1",
+            "SGLANG_MIXED_KV_HP_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_SCALE_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_MAX_QUANT_TOKENS": "32768",
+        }
+        with mock_cpu_env(), _patch.dict(os.environ, env, clear=False):
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1 << 40, mr.server_args.page_size)
+
+        self.assertEqual(config.max_total_num_tokens, 32768)
+
+    def test_mixed_int2_quant_token_cap_can_be_disabled(self):
+        import os
+        from unittest.mock import patch as _patch
+
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = _make_model_runner(
+            kv_cache_dtype="int2",
+            num_kv_heads=4,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=8,
+            kv_cache_quant_group_size=32,
+            page_size=8,
+        )
+        env = {
+            "SGLANG_ENABLE_MIXED_KV_WINDOWS": "1",
+            "SGLANG_MIXED_KV_HP_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_SCALE_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_MAX_QUANT_TOKENS": "0",
+        }
+        with mock_cpu_env(), _patch.dict(os.environ, env, clear=False):
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1 << 30, mr.server_args.page_size)
+
+        self.assertGreater(config.max_total_num_tokens, 32768)
+
+    def test_mixed_int2_deducts_hp_window_reserve_before_quant_sizing(self):
+        import os
+        from unittest.mock import patch as _patch
+
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = _make_model_runner(
+            kv_cache_dtype="int2",
+            num_kv_heads=4,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=8,
+            kv_cache_quant_group_size=32,
+            page_size=8,
+            max_running_requests=2,
+        )
+        env = {
+            "SGLANG_ENABLE_MIXED_KV_WINDOWS": "1",
+            "SGLANG_MIXED_KV_PREFIX_TOKENS": "32",
+            "SGLANG_MIXED_KV_RECENT_TOKENS": "128",
+            "SGLANG_MIXED_KV_HP_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_SCALE_DTYPE": "bfloat16",
+            "SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS": "0",
+            "SGLANG_MIXED_KV_MAX_QUANT_TOKENS": "0",
+        }
+        with mock_cpu_env(), _patch.dict(os.environ, env, clear=False):
+            cfg = create_memory_pool_configurator(mr)
+            available_bytes = cfg._mixed_kv_hp_reserve_bytes + cfg._cell_size * 1024
+            config = cfg.calculate_pool_sizes(available_bytes, mr.server_args.page_size)
+
+        self.assertEqual(config.max_total_num_tokens, 1024)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

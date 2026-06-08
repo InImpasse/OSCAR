@@ -549,15 +549,18 @@ class ModelRunnerKVCacheMixin:
                     num_quant_pages = (
                         self.max_total_num_tokens + n_q - 1
                     ) // n_q + 1
-                    # HP-prefix pool: default to 16x max_running_reqs * P (rounded
-                    # up to N_Q). 0 disables HP-prefix caching.
+                    # HP-prefix pool: keep a small shared reserve for prefix-cache
+                    # reuse across sequential prompts. A bare 1x max_running_reqs
+                    # * P default is too tight: the first completed prompt can
+                    # leave all prefix pages in the radix cache, starving the next
+                    # prompt before eviction has useful HP-prefix slack.
                     p_tokens = envs.SGLANG_MIXED_KV_PREFIX_TOKENS.get()
                     hp_prefix_pool = (
                         envs.SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS.get()
                     )
                     if hp_prefix_pool <= 0:
-                        hp_prefix_pool = (
-                            self.req_to_token_pool.size * p_tokens * 16
+                        hp_prefix_pool = max(
+                            1024, self.req_to_token_pool.size * p_tokens
                         )
                     hp_prefix_pool = (
                         (hp_prefix_pool + n_q - 1) // n_q * n_q

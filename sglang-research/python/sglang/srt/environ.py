@@ -217,8 +217,14 @@ class Envs:
     SGLANG_MIXED_KV_HP_DTYPE = EnvStr("bfloat16")
     SGLANG_MIXED_KV_SCALE_DTYPE = EnvStr("float32")
     # Shared HP-prefix pool size (in HP slot units; rounded up to N_Q).
-    # 0 = use the default of ``max_running_requests * P * 16``.
+    # 0 = use the memory-saving default of at least 1024 slots. This leaves
+    # enough slack for prefix-cache reuse across sequential prompts while still
+    # keeping the HP arena small compared with bf16 KV.
     SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS = EnvInt(0)
+    # Optional cap for the int2 quant arena in mixed-KV mode. This keeps
+    # compression runs from turning all saved bytes into extra KV capacity.
+    # 0 = no cap; otherwise rounded up/down to page boundaries by callers.
+    SGLANG_MIXED_KV_MAX_QUANT_TOKENS = EnvInt(32768)
     # Oscar rotation + per-row clip for int2 KV cache. Learned per-layer
     # orthogonal matrices loaded from K/V rotation checkpoints.
     SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
