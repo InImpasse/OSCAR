@@ -1871,9 +1871,20 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Construct a warmup request
     is_vlm = bool(model_info.get("has_image_understanding", False))
+    chat_template = getattr(
+        _global_state.tokenizer_manager.tokenizer,
+        "chat_template",
+        None,
+    )
+    has_chat_template = bool(chat_template)
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
+        elif not server_args.skip_tokenizer_init and not has_chat_template:
+            # Base text models without a chat template are usually served through
+            # /v1/completions in this repo; warming them up through /generate can
+            # leave startup stuck in ServerStatus.Starting on Granite OSCAR int2.
+            request_name = "/v1/completions"
         else:
             request_name = "/generate"
     else:
@@ -1920,6 +1931,14 @@ def _execute_server_warmup(server_args: ServerArgs):
             "stream": False,
             "temperature": 0.0,
         }
+    elif request_name == "/v1/completions":
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "prompt": "The capital city of France is",
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
@@ -1945,6 +1964,13 @@ def _execute_server_warmup(server_args: ServerArgs):
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
                 verify=ssl_verify,
             )
+            if res.status_code != 200:
+                logger.error(
+                    "Warmup request failed: endpoint=%s status=%s body=%s",
+                    request_name,
+                    res.status_code,
+                    res.text,
+                )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
