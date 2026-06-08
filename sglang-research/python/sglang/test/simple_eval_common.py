@@ -1,6 +1,7 @@
 # Adapted from https://github.com/openai/simple-evals/
 
 import os
+import re
 import resource
 import time
 from collections import defaultdict
@@ -336,6 +337,26 @@ def format_multichoice_question(row):
 
 
 def check_equality(sampler: SamplerBase, expr1: str, expr2: str):
+    if os.getenv("SGLANG_SIMPLE_EVAL_USE_LLM_EQUALITY", "0") != "1":
+        def _normalize(expr: str):
+            expr = "" if expr is None else str(expr)
+            expr = expr.strip().strip("$").strip()
+            expr = expr.replace("\\boxed", "")
+            expr = expr.replace("{", "").replace("}", "")
+            expr = expr.replace(",", "")
+            expr = re.sub(r"\\(?:left|right)", "", expr)
+            expr = re.sub(r"\s+", "", expr).lower()
+            return expr
+
+        a = _normalize(expr1)
+        b = _normalize(expr2)
+        if a == b:
+            return True
+        try:
+            return abs(float(a) - float(b)) <= 1e-9
+        except (TypeError, ValueError):
+            return False
+
     prompt = EQUALITY_TEMPLATE % {"expression1": expr1, "expression2": expr2}
     response = sampler([dict(content=prompt, role="user")])
     return (response or "").lower().strip() == "yes"
