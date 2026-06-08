@@ -721,6 +721,11 @@ class Req(ReqDllmMixin):
         # request-owned slack. Radix insertion must stay below this boundary
         # until the request frees the page as a whole.
         self.mixed_kv_quant_slack_cutoff_len: Optional[int] = None
+        # Per-chunk logical token boundary for the mixed-KV live tail. Unlike
+        # partial-page slack, this is overwritten every extend chunk: it keeps
+        # the current non-final HP-recent tail out of radix without permanently
+        # limiting future chunks.
+        self.mixed_kv_cacheable_cutoff_len: Optional[int] = None
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1211,6 +1216,7 @@ class Req(ReqDllmMixin):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
         self.mixed_kv_quant_slack_cutoff_len = None
+        self.mixed_kv_cacheable_cutoff_len = None
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
@@ -1363,6 +1369,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    mixed_kv_extend_has_hp: bool = False
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -2388,6 +2395,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.mixed_kv_extend_has_hp |= other.mixed_kv_extend_has_hp
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2419,6 +2427,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
+            mixed_kv_extend_has_hp=self.mixed_kv_extend_has_hp,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -2484,6 +2493,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            mixed_kv_extend_has_hp=self.mixed_kv_extend_has_hp,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
@@ -2584,6 +2594,7 @@ class ModelWorkerBatch:
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
+    mixed_kv_extend_has_hp: bool
 
     # For logprob
     return_logprob: bool

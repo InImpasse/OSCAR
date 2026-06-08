@@ -2591,6 +2591,16 @@ class ServerArgs:
         # ``python/sglang/srt/mem_cache/unified_kv_allocator.py``).
         if self._unified_mixed_kv_active():
             n_q = self._unified_mixed_kv_page_size()
+            if (
+                not self.disable_piecewise_cuda_graph
+                and not self.enforce_piecewise_cuda_graph
+            ):
+                logger.warning(
+                    "Unified mixed KV (int2) currently disables piecewise CUDA "
+                    "graph because dense int2 extend can return a non-output "
+                    "hidden width under graph replay."
+                )
+                self.disable_piecewise_cuda_graph = True
             if self.page_size is None:
                 self.page_size = n_q
                 logger.info(

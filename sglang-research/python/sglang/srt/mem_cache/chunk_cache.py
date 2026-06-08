@@ -72,6 +72,7 @@ class ChunkCache(BasePrefixCache):
 
         req.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
         req.mixed_kv_quant_slack_cutoff_len = None
+        req.mixed_kv_cacheable_cutoff_len = None
         return torch.cat([indices.to(torch.int64), slack.to(indices.device)])
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):

@@ -295,6 +295,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int
+    mixed_kv_extend_has_hp: bool = False
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
@@ -449,6 +450,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mixed_kv_extend_has_hp=batch.mixed_kv_extend_has_hp,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

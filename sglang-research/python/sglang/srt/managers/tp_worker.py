@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -57,6 +59,27 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
 
 
 class BaseTpWorker(ABC):
@@ -457,7 +480,9 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
+            init_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            _mixed_kv_cycle_profile_log("tp_forward_batch_init_new", init_t0)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -466,11 +491,13 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            forward_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            _mixed_kv_cycle_profile_log("tp_model_runner_forward", forward_t0)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -499,9 +526,11 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                sample_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                _mixed_kv_cycle_profile_log("tp_sample", sample_t0)
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens

@@ -215,6 +215,9 @@ class UnifiedInt2HPKVPool(KVCache):
         self._flush_counter = torch.zeros(
             (self.max_req_slots,), dtype=torch.int32, device=self.device
         )
+        self._flush_counter_cpu = torch.zeros(
+            (self.max_req_slots,), dtype=torch.int32
+        )
         self._next_slab_offset = torch.zeros(
             (self.max_req_slots,), dtype=torch.int32, device=self.device
         )
@@ -369,10 +372,12 @@ class UnifiedInt2HPKVPool(KVCache):
                 return
             self._next_slab_offset[idx] = 0
             self._flush_counter[idx] = 0
+            self._flush_counter_cpu[idx.cpu()] = 0
         else:
             i = int(req_pool_idx)
             self._next_slab_offset[i] = 0
             self._flush_counter[i] = 0
+            self._flush_counter_cpu[i] = 0
 
     def _resolve_quant_grouping(self, head_dim: int, tensor_name: str) -> tuple[int, int]:
         group_size = (
@@ -757,6 +762,7 @@ class UnifiedInt2HPKVPool(KVCache):
         layer_id_override: Optional[int] = None,
         already_hadamard_transformed: bool = False,
         is_decode: bool = False,
+        mixed_extend_has_hp: Optional[bool] = None,
     ):
         """Write K/V to the unified pool.
 
@@ -801,6 +807,8 @@ class UnifiedInt2HPKVPool(KVCache):
             mixed_hp_offset=int(self._hp_offset),
             v_rotation_absorbed=v_rotation_absorbed,
         )
+        if mixed_extend_has_hp is False:
+            return
         cache_k_hp, cache_v_hp = self._prepare_hp_kv_tensors(
             layer_id,
             cache_k,
@@ -808,7 +816,7 @@ class UnifiedInt2HPKVPool(KVCache):
             already_hadamard_transformed,
             v_rotation_absorbed,
         )
-        self._set_mixed_hp_kv_buffer(layer_id, loc, cache_k_hp, cache_v_hp)
+        self._set_mixed_hp_kv_buffer(layer_id, loc.to(torch.int64), cache_k_hp, cache_v_hp)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if tgt_loc.numel() == 0:

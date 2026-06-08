@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -33,6 +35,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
 
 
 class SchedulerOutputProcessorMixin:
@@ -376,8 +399,11 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        process_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
         if result.copy_done is not None:
+            copy_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             result.copy_done.synchronize()
+            _mixed_kv_cycle_profile_log("decode_copy_done_sync", copy_t0)
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -424,6 +450,7 @@ class SchedulerOutputProcessorMixin:
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
         for i, req in enumerate(batch.reqs):
+            req_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
@@ -516,9 +543,14 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+            _mixed_kv_cycle_profile_log("decode_req_postprocess", req_t0)
 
+        stream_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
         self.stream_output(batch.reqs, batch.return_logprob)
+        _mixed_kv_cycle_profile_log("decode_stream_output", stream_t0)
+        free_group_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
         self.token_to_kv_pool_allocator.free_group_end()
+        _mixed_kv_cycle_profile_log("decode_free_group_end", free_group_t0)
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(
@@ -526,6 +558,7 @@ class SchedulerOutputProcessorMixin:
             running_batch=batch,
             num_accepted_tokens=result.num_accepted_tokens,
         )
+        _mixed_kv_cycle_profile_log("decode_process_total", process_t0)
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

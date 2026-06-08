@@ -25,6 +25,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -34,6 +35,10 @@ from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _mixed_kv_radix_debug_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_RADIX_DEBUG", "0") == "1"
 
 from sglang.srt.disaggregation.kv_events import (
     MEDIUM_GPU,
@@ -529,14 +534,28 @@ class RadixCache(BasePrefixCache):
 
         req.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
         req.mixed_kv_quant_slack_cutoff_len = None
+        req.mixed_kv_cacheable_cutoff_len = None
         return torch.cat([indices.to(torch.int64), slack.to(indices.device)])
 
     def _mixed_kv_slack_insert_limit(self, req: Req, key_len: int) -> int:
-        """Keep radix ownership below any request-owned partial quant page."""
-        cutoff_len = getattr(req, "mixed_kv_quant_slack_cutoff_len", None)
-        if cutoff_len is None:
-            return key_len
-        return max(0, min(key_len, int(cutoff_len)))
+        """Keep radix ownership below request-owned mixed-KV unsafe ranges."""
+        limit = key_len
+        slack_cutoff = getattr(req, "mixed_kv_quant_slack_cutoff_len", None)
+        if slack_cutoff is not None:
+            limit = min(limit, int(slack_cutoff))
+        cacheable_cutoff = getattr(req, "mixed_kv_cacheable_cutoff_len", None)
+        if cacheable_cutoff is not None:
+            limit = min(limit, int(cacheable_cutoff))
+        return max(0, min(key_len, limit))
+
+    def _debug_mixed_kv_radix(self, event: str, **fields) -> None:
+        if not _mixed_kv_radix_debug_enabled():
+            return
+        logger.info(
+            "Mixed-KV radix %s: %s",
+            event,
+            " ".join(f"{k}={v}" for k, v in fields.items()),
+        )
 
     def _committed_fill_ids(self, req: Req) -> list[int]:
         committed_len = min(int(req.kv_committed_len), len(req.fill_ids))
@@ -567,28 +586,21 @@ class RadixCache(BasePrefixCache):
             req.cache_protected_len = protected_len
 
         if self._mixed_kv_enabled:
-            # Mixed-KV: the radix tree is populated ONLY by
-            # ``cache_unfinished_req`` (called once after each request's
-            # prefill via the scheduler output-processor mixin).
-            # ``cache_finished_req`` deliberately returns early for both
-            # is_insert=True (natural finish) and is_insert=False (retract):
-            # finished/retracted requests just free their tail slots and
-            # ``dec_lock_ref`` — they do NOT extend the tree.
-            #
-            # The naive "insert + bypass-cap re-match + inc_lock_ref(new)
-            # → dec_lock_ref(old)" pattern is unsafe under mixed-KV +
-            # retract: the new leaf has ``lock_ref=0`` immediately and
-            # gets evicted under concurrent retract memory pressure,
-            # freeing slot ids that other live requests' ``req_to_token``
-            # mappings still reference → corrupted reads → gibberish
-            # (~0.5% rate at this batch size, confirmed against the
-            # mixed-pool reference implementation which has the same
-            # early-return).
-            self.token_to_kv_pool_allocator.free(
-                self._with_mixed_quant_slack(req, kv_indices[protected_len:])
-            )
-            self.dec_lock_ref(req.last_node)
-            return
+            # Retract/cancel remains on the conservative path: do not extend
+            # the tree with an immediately-unlocked node while the scheduler is
+            # under memory pressure. Natural finishes can safely use the normal
+            # insertion path below, which already trims HP-recent and clamps
+            # partial quant-page slack before radix ownership changes. This is
+            # important for longrun stability/perf: relying only on
+            # cache_unfinished_req leaves the final prefill chunks out of the
+            # tree, so sequential long prompts repeatedly recompute most of the
+            # prefix.
+            if not is_insert:
+                self.token_to_kv_pool_allocator.free(
+                    self._with_mixed_quant_slack(req, kv_indices[protected_len:])
+                )
+                self.dec_lock_ref(req.last_node)
+                return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -613,6 +625,20 @@ class RadixCache(BasePrefixCache):
             keys = keys[:insert_limit]
             values = values[:insert_limit]
             radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+
+        if self._mixed_kv_enabled:
+            self._debug_mixed_kv_radix(
+                "finish_insert",
+                is_insert=is_insert,
+                committed=kv_committed_len,
+                token_ids=len(token_ids),
+                protected=protected_len,
+                keys=len(keys),
+                mixed_trim=mixed_trim,
+                insert_limit=insert_limit,
+                slack_cutoff=getattr(req, "mixed_kv_quant_slack_cutoff_len", None),
+                cacheable_cutoff=getattr(req, "mixed_kv_cacheable_cutoff_len", None),
+            )
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -743,6 +769,22 @@ class RadixCache(BasePrefixCache):
             match_result.last_device_node,
         )
         full_match_len = len(new_indices)
+        if self._mixed_kv_enabled:
+            self._debug_mixed_kv_radix(
+                "unfinished",
+                chunked=chunked,
+                committed=len(token_ids),
+                protected=protected_len,
+                keys=len(keys),
+                insert_keys=len(insert_keys),
+                mixed_trim=mixed_trim,
+                insert_limit=insert_limit,
+                new_prefix_len=new_prefix_len,
+                match_len=match_len,
+                full_match_len=full_match_len,
+                slack_cutoff=getattr(req, "mixed_kv_quant_slack_cutoff_len", None),
+                cacheable_cutoff=getattr(req, "mixed_kv_cacheable_cutoff_len", None),
+            )
         # The tree must contain at least what we just inserted.
         assert full_match_len >= new_prefix_len, (
             f"{full_match_len=} regressed below {new_prefix_len=}; tree "

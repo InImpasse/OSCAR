@@ -1,5 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
+import os
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -35,6 +38,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
 
 
 @triton.jit
@@ -80,8 +107,8 @@ def _scatter_mixed_kv_indices_kernel(
     seq_lens_ptr,           # int32 or int64 [bs] -- cast inside
     hp_kv_indptr_ptr,       # int32 [bs + 1]   already cumsum'd
     quant_kv_indptr_ptr,    # int32 [bs + 1]   already cumsum'd
-    hp_kv_indices_ptr,      # int64 [*] destination, pre-sized
-    quant_kv_indices_ptr,   # int64 [*] destination, pre-sized
+    hp_kv_indices_ptr,      # int32 [*] destination, pre-sized
+    quant_kv_indices_ptr,   # int32 [*] destination, pre-sized
     rtt_stride_row,
     HP_OFFSET: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -137,12 +164,12 @@ def _scatter_mixed_kv_indices_kernel(
 
         tl.store(
             hp_kv_indices_ptr + hp_base + (hp_running + hp_rank).to(tl.int64),
-            slot - HP_OFFSET,
+            (slot - HP_OFFSET).to(tl.int32),
             mask=is_hp,
         )
         tl.store(
             quant_kv_indices_ptr + quant_base + (quant_running + quant_rank).to(tl.int64),
-            slot,
+            slot.to(tl.int32),
             mask=is_quant,
         )
 
@@ -267,6 +294,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
+        self.max_total_num_tokens = getattr(model_runner, "max_total_num_tokens", None)
         self.enable_mixed_kv = (
             getattr(model_runner.token_to_kv_pool, "mixed_kv_enabled", None) is not None
             and model_runner.token_to_kv_pool.mixed_kv_enabled()
@@ -376,6 +404,51 @@ class TritonAttnBackend(AttentionBackend):
 
         self.cuda_graph_custom_mask = None
 
+        if self.enable_mixed_kv:
+            mixed_capacity = (
+                min(self.max_context_len, int(self.max_total_num_tokens))
+                if self.max_total_num_tokens is not None
+                else self.max_context_len
+            )
+            self._mixed_max_seq_sum = max_bs * mixed_capacity
+            total_splits = self.max_kv_splits + self.max_hp_kv_splits
+            self._mixed_hp_kv_indptr_buf = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self._mixed_quant_kv_indptr_buf = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self._mixed_hp_kv_indices_buf = torch.empty(
+                (self._mixed_max_seq_sum,), dtype=torch.int32, device=self.device
+            )
+            self._mixed_quant_kv_indices_buf = torch.empty(
+                (self._mixed_max_seq_sum,), dtype=torch.int32, device=self.device
+            )
+            self._mixed_attn_logits_buf = torch.empty(
+                (max_bs, self.num_head, total_splits, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._mixed_attn_lse_buf = torch.empty(
+                (max_bs, self.num_head, total_splits),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._mixed_hp_num_kv_splits_buf = torch.full(
+                (max_bs,),
+                self.max_hp_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._mixed_quant_num_kv_splits_buf = torch.empty(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+            self._mixed_hp_lens_buf = torch.empty(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+        else:
+            self._mixed_max_seq_sum = 0
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -448,6 +521,7 @@ class TritonAttnBackend(AttentionBackend):
         quant_kv_indptr: torch.Tensor,
         quant_kv_indices: torch.Tensor,
         bs: int,
+        hp_lens_out: torch.Tensor | None = None,
     ):
         """Classify each token's slot id as HP vs quant and scatter into the
         caller-provided per-tier index buffers.
@@ -477,7 +551,7 @@ class TritonAttnBackend(AttentionBackend):
         # Cast seq_lens to int32 once; both mixed-KV Triton kernels want
         # int32. Keeps the conversion off the hot path's per-step alloc trail.
         seq_lens_i32 = seq_lens.to(torch.int32)
-        hp_lens = torch.empty_like(seq_lens_i32)
+        hp_lens = hp_lens_out if hp_lens_out is not None else torch.empty_like(seq_lens_i32)
         # Count directly from ``req_to_token`` so the hot path no longer
         # materializes a dense gathered ``rows`` tensor or boolean masks.
         _count_mixed_hp_lens_kernel[(bs,)](
@@ -545,6 +619,7 @@ class TritonAttnBackend(AttentionBackend):
         k3 = pre_rotated_k if pre_rotated_k is not None else k.contiguous()
         v3 = pre_rotated_v if pre_rotated_v is not None else v.contiguous()
         if need_v_inverse_override is None:
+            prep_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             q3, k3, v3, need_v_inverse = prepare_quantized_extend_qkv(
                 kv_pool,
                 layer,
@@ -556,38 +631,61 @@ class TritonAttnBackend(AttentionBackend):
                     pre_rotated_k is not None and pre_rotated_v is not None
                 ),
             )
+            _mixed_kv_cycle_profile_log("dense_prepare_quantized_qkv", prep_t0)
         else:
             need_v_inverse = need_v_inverse_override
 
+        concat_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
+        prefix_indptr = self.forward_metadata.kv_indptr
+        extend_start_loc = forward_batch.extend_start_loc
+        dequant_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
         prefix_k, prefix_v = dequantize_prefix_kv(
             kv_pool,
             layer.layer_id,
             self.forward_metadata.kv_indices,
             q3.dtype,
         )
+        _mixed_kv_cycle_profile_log("dense_dequantize_prefix_kv", dequant_t0)
 
-        unified_k_parts = []
-        unified_v_parts = []
-        unified_k_lens = []
-        prefix_indptr = self.forward_metadata.kv_indptr
-        extend_start_loc = forward_batch.extend_start_loc
-        for i, extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
-            prefix_start = int(prefix_indptr[i].item())
-            prefix_end = int(prefix_indptr[i + 1].item())
-            extend_start = int(extend_start_loc[i].item())
-            extend_end = extend_start + int(extend_len)
-            req_k = torch.cat(
-                [prefix_k[prefix_start:prefix_end], k3[extend_start:extend_end]], dim=0
+        if len(forward_batch.extend_seq_lens_cpu) == 1:
+            extend_len = int(forward_batch.extend_seq_lens_cpu[0])
+            prefix_len = int(prefix_k.shape[0])
+            extend_start = int(extend_start_loc[0].item())
+            extend_end = extend_start + extend_len
+            unified_len = prefix_len + extend_len
+            unified_k = torch.empty(
+                (unified_len, *k3.shape[1:]), dtype=k3.dtype, device=k3.device
             )
-            req_v = torch.cat(
-                [prefix_v[prefix_start:prefix_end], v3[extend_start:extend_end]], dim=0
+            unified_v = torch.empty(
+                (unified_len, *v3.shape[1:]), dtype=v3.dtype, device=v3.device
             )
-            unified_k_parts.append(req_k)
-            unified_v_parts.append(req_v)
-            unified_k_lens.append(req_k.shape[0])
+            if prefix_len:
+                unified_k[:prefix_len].copy_(prefix_k)
+                unified_v[:prefix_len].copy_(prefix_v)
+            unified_k[prefix_len:].copy_(k3[extend_start:extend_end])
+            unified_v[prefix_len:].copy_(v3[extend_start:extend_end])
+            unified_k_lens = [unified_len]
+        else:
+            unified_k_parts = []
+            unified_v_parts = []
+            unified_k_lens = []
+            for i, extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
+                prefix_start = int(prefix_indptr[i].item())
+                prefix_end = int(prefix_indptr[i + 1].item())
+                extend_start = int(extend_start_loc[i].item())
+                extend_end = extend_start + int(extend_len)
+                req_k = torch.cat(
+                    [prefix_k[prefix_start:prefix_end], k3[extend_start:extend_end]], dim=0
+                )
+                req_v = torch.cat(
+                    [prefix_v[prefix_start:prefix_end], v3[extend_start:extend_end]], dim=0
+                )
+                unified_k_parts.append(req_k)
+                unified_v_parts.append(req_v)
+                unified_k_lens.append(req_k.shape[0])
 
-        unified_k = torch.cat(unified_k_parts, dim=0) if unified_k_parts else k3[:0]
-        unified_v = torch.cat(unified_v_parts, dim=0) if unified_v_parts else v3[:0]
+            unified_k = torch.cat(unified_k_parts, dim=0) if unified_k_parts else k3[:0]
+            unified_v = torch.cat(unified_v_parts, dim=0) if unified_v_parts else v3[:0]
         cu_seqlens_q = self.forward_metadata.qo_indptr.to(torch.int32)
         cu_seqlens_k = torch.empty(
             (len(unified_k_lens) + 1,), dtype=torch.int32, device=self.device
@@ -596,11 +694,13 @@ class TritonAttnBackend(AttentionBackend):
         cu_seqlens_k[1:] = torch.cumsum(
             torch.tensor(unified_k_lens, dtype=torch.int32, device=self.device), dim=0
         )
+        _mixed_kv_cycle_profile_log("dense_concat_prefix_extend", concat_t0)
 
         if torch.cuda.get_device_capability(q3.device)[0] == 12:
             # SM120 cannot execute the current FA3/FA4 kernels used by this
             # dense INT2 prefill path. Use SDPA over the already dequantized
             # per-request K/V so INT2 cache correctness remains testable.
+            attn_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             outputs = []
             k_cursor = 0
             q_group = layer.tp_q_head_num // layer.tp_k_head_num
@@ -647,7 +747,9 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 outputs.append(out_req.squeeze(0).transpose(0, 1))
             result = torch.cat(outputs, dim=0) if outputs else q3.new_empty(o.shape)
+            _mixed_kv_cycle_profile_log("dense_sdpa_attention", attn_t0)
         else:
+            attn_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             result = flash_attn_varlen_func(
                 q=q3,
                 k=unified_k,
@@ -661,8 +763,27 @@ class TritonAttnBackend(AttentionBackend):
                 window_size=(-1, -1),
                 softcap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
             )
+            _mixed_kv_cycle_profile_log("dense_flash_attention", attn_t0)
+        inverse_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
         result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
-        o.copy_(result.view_as(o))
+        _mixed_kv_cycle_profile_log("dense_inverse_v_rotation", inverse_t0)
+        # Piecewise CUDA graph replay pads q/o to the static bucket size, while
+        # metadata and varlen attention are built from the unpadded request. Copy
+        # only real tokens in that case; logits are sliced back to raw tokens by
+        # the graph runner, so padded rows are intentionally ignored.
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        copy_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
+        if result.numel() == o_view.numel():
+            o_view.copy_(result.view_as(o_view))
+        else:
+            result_view = result.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if result_view.shape[0] > o_view.shape[0]:
+                raise RuntimeError(
+                    "quantized dense extend produced more tokens than output buffer: "
+                    f"result={tuple(result_view.shape)} output={tuple(o_view.shape)}"
+                )
+            o_view[: result_view.shape[0]].copy_(result_view)
+        _mixed_kv_cycle_profile_log("dense_copy_output", copy_t0)
         return o
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -683,6 +804,7 @@ class TritonAttnBackend(AttentionBackend):
         mixed_attn_lse = None
         mixed_hp_num_kv_splits = None
         mixed_quant_num_kv_splits = None
+        hp_lens = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -723,42 +845,21 @@ class TritonAttnBackend(AttentionBackend):
                     )
                     self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
                 if self.enable_mixed_kv:
-                    mixed_hp_kv_indptr = torch.zeros(
-                        (bs + 1,), dtype=torch.int32, device=self.device
+                    seq_sum = int(forward_batch.seq_lens_sum)
+                    assert seq_sum <= self._mixed_max_seq_sum, (
+                        f"mixed KV seq_sum={seq_sum} exceeds buffer "
+                        f"capacity={self._mixed_max_seq_sum}"
                     )
-                    mixed_quant_kv_indptr = torch.zeros(
-                        (bs + 1,), dtype=torch.int32, device=self.device
-                    )
-                    mixed_hp_kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum,
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                    mixed_quant_kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum,
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                    total_splits = self.max_kv_splits + self.max_hp_kv_splits
-                    # Single combined stage-1 scratch. LSE is pre-filled with
-                    # -inf so the tier-agnostic stage-2 can skip unused splits.
-                    mixed_attn_logits = torch.empty(
-                        (bs, self.num_head, total_splits, self.v_head_dim),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    mixed_attn_lse = torch.full(
-                        (bs, self.num_head, total_splits),
-                        float("-inf"),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    mixed_hp_num_kv_splits = torch.full(
-                        (bs,), self.max_hp_kv_splits, dtype=torch.int32, device=self.device
-                    )
-                    mixed_quant_num_kv_splits = torch.empty(
-                        (bs,), dtype=torch.int32, device=self.device
-                    )
+                    mixed_hp_kv_indptr = self._mixed_hp_kv_indptr_buf[: bs + 1]
+                    mixed_quant_kv_indptr = self._mixed_quant_kv_indptr_buf[: bs + 1]
+                    mixed_hp_kv_indices = self._mixed_hp_kv_indices_buf[:seq_sum]
+                    mixed_quant_kv_indices = self._mixed_quant_kv_indices_buf[:seq_sum]
+                    mixed_attn_logits = self._mixed_attn_logits_buf[:bs]
+                    mixed_attn_lse = self._mixed_attn_lse_buf[:bs]
+                    mixed_attn_lse.fill_(float("-inf"))
+                    mixed_hp_num_kv_splits = self._mixed_hp_num_kv_splits_buf[:bs]
+                    mixed_quant_num_kv_splits = self._mixed_quant_num_kv_splits_buf[:bs]
+                    hp_lens = self._mixed_hp_lens_buf[:bs]
                     self._build_mixed_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -767,6 +868,7 @@ class TritonAttnBackend(AttentionBackend):
                         mixed_quant_kv_indptr,
                         mixed_quant_kv_indices,
                         bs,
+                        hp_lens_out=hp_lens,
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -791,11 +893,15 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            if self.enable_mixed_kv:
-                # HP uses the fixed cap above; only the quant tier is
-                # right-sized, and it uses the full sequence length as a cheap
-                # planning proxy instead of per-tier mixed-KV counts.
-                self.get_num_kv_splits(mixed_quant_num_kv_splits, forward_batch.seq_lens)
+            if self.enable_mixed_kv and mixed_quant_num_kv_splits is not None:
+                if hp_lens is not None:
+                    quant_lens = forward_batch.seq_lens.to(torch.int32) - hp_lens
+                    quant_lens.clamp_(min=0)
+                    self.get_num_kv_splits(mixed_quant_num_kv_splits, quant_lens)
+                else:
+                    self.get_num_kv_splits(
+                        mixed_quant_num_kv_splits, forward_batch.seq_lens
+                    )
             else:
                 self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
@@ -998,6 +1104,11 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
         if self.enable_mixed_kv:
+            mixed_capacity = (
+                min(self.max_context_len, int(self.max_total_num_tokens))
+                if self.max_total_num_tokens is not None
+                else self.max_context_len
+            )
             self.cuda_graph_mixed_hp_kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=self.device
             )
@@ -1005,13 +1116,13 @@ class TritonAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int32, device=self.device
             )
             self.cuda_graph_mixed_hp_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.int64,
+                (max_num_tokens * mixed_capacity),
+                dtype=torch.int32,
                 device=self.device,
             )
             self.cuda_graph_mixed_quant_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.int64,
+                (max_num_tokens * mixed_capacity),
+                dtype=torch.int32,
                 device=self.device,
             )
             total_splits = self.max_kv_splits + self.max_hp_kv_splits
@@ -1493,6 +1604,7 @@ class TritonAttnBackend(AttentionBackend):
         pre_rotated_v = None
         need_v_inverse = None
         fp_quant_oscar_extend = False
+        use_fused_oscar_set_kv = False
 
         use_fp_quant_oscar_prefill = (
             not self.enable_deterministic
@@ -1515,6 +1627,7 @@ class TritonAttnBackend(AttentionBackend):
             # Int2 prefill used to rotate K/V once for attention and again when
             # writing the KV cache. Pre-rotate them here so both consumers can
             # share the same tensors.
+            prep_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             pre_rotated_q, pre_rotated_k, pre_rotated_v, need_v_inverse = (
                 prepare_quantized_extend_qkv(
                     kv_pool,
@@ -1524,7 +1637,14 @@ class TritonAttnBackend(AttentionBackend):
                     v.contiguous(),
                 )
             )
+            use_fused_oscar_set_kv = (
+                envs.SGLANG_OSCAR_FUSED_ROTATE_CLIP_QUANT.get()
+                and _pool_uses_oscar_rotation(kv_pool)
+                and bool(getattr(layer, "oscar_v_rotation_absorbed", False))
+            )
+            _mixed_kv_cycle_profile_log("extend_prepare_quantized_qkv", prep_t0)
         elif use_fp_quant_oscar_prefill:
+            prep_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             pre_rotated_q, pre_rotated_k, pre_rotated_v, need_v_inverse = (
                 prepare_quantized_extend_qkv(
                     kv_pool,
@@ -1535,14 +1655,36 @@ class TritonAttnBackend(AttentionBackend):
                 )
             )
             fp_quant_oscar_extend = True
+            _mixed_kv_cycle_profile_log("extend_prepare_fp_quant_qkv", prep_t0)
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache and k is not None and v is not None:
-            if (
+            set_kv_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
+            if use_fused_oscar_set_kv:
+                kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k.contiguous(),
+                    v.contiguous(),
+                    layer.k_scale,
+                    layer.v_scale,
+                    already_hadamard_transformed=False,
+                    is_decode=False,
+                    mixed_extend_has_hp=forward_batch.mixed_kv_extend_has_hp,
+                )
+            elif (
                 pre_rotated_k is not None
                 and pre_rotated_v is not None
                 and getattr(kv_pool, "dtype", None) == "int2"
             ):
+                set_kv_kwargs = dict(
+                    already_hadamard_transformed=True,
+                    is_decode=False,
+                )
+                if _pool_uses_oscar_rotation(kv_pool):
+                    set_kv_kwargs["mixed_extend_has_hp"] = (
+                        forward_batch.mixed_kv_extend_has_hp
+                    )
                 kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
@@ -1550,8 +1692,7 @@ class TritonAttnBackend(AttentionBackend):
                     pre_rotated_v,
                     layer.k_scale,
                     layer.v_scale,
-                    already_hadamard_transformed=True,
-                    is_decode=False,
+                    **set_kv_kwargs,
                 )
             elif (
                 pre_rotated_k is not None
@@ -1587,6 +1728,7 @@ class TritonAttnBackend(AttentionBackend):
                     layer.k_scale,
                     layer.v_scale,
                 )
+            _mixed_kv_cycle_profile_log("extend_set_kv_buffer", set_kv_t0)
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:

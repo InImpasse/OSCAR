@@ -306,6 +306,16 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         ).reshape(-1)
         return slots.contiguous()
 
+    def alloc_quant_page(self):
+        """Allocate one quant page and return its page id as int64 [1]."""
+        if self.need_sort and self.free_pages.numel() == 0:
+            self.merge_and_sort_free()
+        if self.free_pages.numel() == 0:
+            return None
+        page = self.free_pages[:1]
+        self.free_pages = self.free_pages[1:]
+        return page.contiguous()
+
     # -- Free path (sync-free, GPU-resident) -------------------------------
 
     def free(self, free_index: torch.Tensor):
@@ -323,7 +333,11 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         is_quant = idx < self._hp_offset
         quant_index = idx[is_quant]
         if quant_index.numel() > 0:
-            quant_pages = torch.unique((quant_index // self.N_Q).to(torch.int64))
+            if quant_index.numel() <= self.N_Q:
+                # Single-request decode flush returns at most one quant page.
+                quant_pages = (quant_index[0:1] // self.N_Q).to(torch.int64)
+            else:
+                quant_pages = torch.unique((quant_index // self.N_Q).to(torch.int64))
             if self.need_sort:
                 self.release_pages = torch.cat([quant_pages, self.release_pages])
             else:

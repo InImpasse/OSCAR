@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +18,7 @@ from sglang.srt.utils.common import ceil_align
 from sglang.QuantKernel.gpu_flush_int2 import (
     gpu_flush_int2,
     gpu_flush_int2_apply,
+    gpu_flush_int2_dense_bs1,
     gpu_flush_int2_plan,
 )
 
@@ -27,6 +30,51 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+def _mixed_kv_flush_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_FLUSH_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_flush_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_flush_profile_enabled():
+        logger.info(
+            "mixed_kv_flush_profile %s_ms=%.3f",
+            label,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+
+
+def _mixed_kv_dense_bs1_flush_enabled() -> bool:
+    value = os.environ.get("SGLANG_MIXED_KV_DENSE_BS1_FLUSH")
+    if value is None:
+        return True
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
 
 
 @triton.jit
@@ -489,6 +537,30 @@ def _alloc_for_extend_mixed(
             if getattr(result, "num_tokens_evicted", 0) == 0:
                 break
 
+    # The unified allocator exposes quant and HP-prefix as one scheduler-facing
+    # capacity, but they are separate physical free lists. Short prompts with
+    # many distinct prefixes can drain the small HP-prefix pool while quant
+    # still has plenty of free pages, so the total-capacity eviction above may
+    # skip eviction and let alloc_hp_prefix fail. Converge on enough HP-prefix
+    # pages explicitly before allocating from that tier.
+    if (
+        total_hp_prefix_alloc > 0
+        and batch.tree_cache is not None
+        and not batch.tree_cache.is_chunk_cache()
+    ):
+        for _ in range(8):
+            free_hp_prefix_slots = (
+                allocator.hp_prefix_free_pages.numel()
+                + allocator.hp_prefix_release_pages.numel()
+            ) * allocator.N_Q
+            if free_hp_prefix_slots >= total_hp_prefix_alloc:
+                break
+            result = batch.tree_cache.evict(
+                EvictParams(num_tokens=max(total_hp_prefix_alloc, allocator.N_Q))
+            )
+            if getattr(result, "num_tokens_evicted", 0) == 0:
+                break
+
     quant_alloc = (
         allocator.alloc_quant(total_quant_alloc)
         if total_quant_alloc > 0
@@ -534,12 +606,9 @@ def _alloc_for_extend_mixed(
             non_final_tail_start = max(
                 0, int(seq_lens_cpu_list[i_req]) - int(kv_pool.hp_recent_tokens)
             )
-            existing_cutoff = getattr(req, "mixed_kv_quant_slack_cutoff_len", None)
-            req.mixed_kv_quant_slack_cutoff_len = (
-                non_final_tail_start
-                if existing_cutoff is None
-                else min(existing_cutoff, non_final_tail_start)
-            )
+            req.mixed_kv_cacheable_cutoff_len = non_final_tail_start
+        else:
+            req.mixed_kv_cacheable_cutoff_len = None
         req_parts = []
         req_hp_prefix = None
         req_hp_recent = None
@@ -634,9 +703,13 @@ def _alloc_for_extend_mixed(
     # copy + scatter so the decode hot path sees the counter without a
     # later sync.
     counter_inits_cpu = torch.tensor(flush_counter_inits, dtype=torch.int32)
+    req_pool_indices_cpu_long = req_pool_indices_cpu.to(torch.int64)
+    kv_pool._flush_counter_cpu[req_pool_indices_cpu_long] = counter_inits_cpu
     counter_inits_device = counter_inits_cpu.to(batch.device, non_blocking=True)
     kv_pool._flush_counter[req_pool_indices_device] = counter_inits_device
-
+    batch.mixed_kv_extend_has_hp = (
+        sum(hp_prefix_counts) + sum(hp_recent_counts)
+    ) > 0
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
@@ -656,16 +729,26 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
     assert kv_pool.flush_interval == flush_interval
 
     req_pool_indices_int64 = batch.req_pool_indices.to(torch.int64)
-
-    # Per-request flush gating: shape-static RMW, no host sync.
-    counters = kv_pool._flush_counter[req_pool_indices_int64]
-    flush_mask = counters == 0
-    new_counters = torch.where(
-        flush_mask,
-        torch.full_like(counters, flush_interval - 1),
-        counters - 1,
+    req_pool_indices_cpu = torch.tensor(
+        [int(req.req_pool_idx) for req in batch.reqs], dtype=torch.int64
     )
+
+    # Per-request flush gating: use a CPU-side mirror to avoid a per-step
+    # device->host sync from ``flush_mask.any().item()`` on bs=1 decode.
+    counters_cpu = kv_pool._flush_counter_cpu[req_pool_indices_cpu]
+    flush_mask_cpu = counters_cpu == 0
+    new_counters_cpu = torch.where(
+        flush_mask_cpu,
+        torch.full_like(counters_cpu, flush_interval - 1),
+        counters_cpu - 1,
+    )
+    kv_pool._flush_counter_cpu[req_pool_indices_cpu] = new_counters_cpu
+
+    flush_mask = flush_mask_cpu.to(batch.device, non_blocking=True)
+    new_counters = new_counters_cpu.to(batch.device, non_blocking=True)
     kv_pool._flush_counter[req_pool_indices_int64] = new_counters
+    # 7/8 decode steps skip demotion; avoid quant alloc/plan/free/apply on them.
+    needs_flush = bool(flush_mask_cpu.any().item())
 
     # Worst case: every req flushes -> bs*N_Q quant slots needed.
     quant_need = bs * flush_interval
@@ -711,89 +794,160 @@ def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.T
         req_pool_indices_int64, [token_per_req] * bs
     )
 
-    dst_quant_slots = allocator.alloc_quant(quant_need)
-    if dst_quant_slots is None:
-        raise RuntimeError(
-            "Mixed KV windows failed to allocate quant flush slots. "
-            f"{allocator.debug_print()}"
-        )
+    plan = None
+    if needs_flush:
+        flush_t0 = time.perf_counter() if _mixed_kv_flush_profile_enabled() else 0.0
+        use_dense_bs1_flush = bs == 1 and _mixed_kv_dense_bs1_flush_enabled()
+        if use_dense_bs1_flush:
+            dst_quant_page = allocator.alloc_quant_page()
+            if dst_quant_page is None:
+                raise RuntimeError(
+                    "Mixed KV windows failed to allocate quant flush page. "
+                    f"{allocator.debug_print()}"
+                )
+            dst_quant_slots = None
+        else:
+            dst_quant_page = None
+            dst_quant_slots = allocator.alloc_quant(quant_need)
+            if dst_quant_slots is None:
+                raise RuntimeError(
+                    "Mixed KV windows failed to allocate quant flush slots. "
+                    f"{allocator.debug_print()}"
+                )
 
-    # Build the protected boundary on device in one go.  This is the
-    # tree-owned prefix that flush must not overwrite; ``prefix_indices`` may
-    # additionally contain request-owned tail slots for chunk continuation.
-    prefix_lens_cpu = torch.tensor(
-        [int(r.cache_protected_len) for r in batch.reqs], dtype=torch.int32
-    )
-    prefix_lens_gpu = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    seq_lens_int32 = batch.seq_lens.to(torch.int32)
+        if use_dense_bs1_flush:
+            _mixed_kv_flush_profile_log("plan", flush_t0)
+        else:
+            # Build the protected boundary on device in one go.  This is the
+            # tree-owned prefix that flush must not overwrite; ``prefix_indices`` may
+            # additionally contain request-owned tail slots for chunk continuation.
+            prefix_lens_cpu = torch.tensor(
+                [int(r.cache_protected_len) for r in batch.reqs], dtype=torch.int32
+            )
+            prefix_lens_gpu = prefix_lens_cpu.to(batch.device, non_blocking=True)
+            seq_lens_int32 = batch.seq_lens.to(torch.int32)
 
-    # Phase 1 (no-race with previous forward): plan kernel reads
-    # ``req_to_token`` and produces ``returned_slot_ids`` etc. Followed by
-    # ``allocator.free``, whose ``torch.unique`` host-syncs only against this
-    # short pre-wait prefix instead of the previous forward. See
-    # plan-for-a-fix-starry-russell.md.
-    plan = gpu_flush_int2_plan(
-        seq_lens=seq_lens_int32,
-        prefix_lens=prefix_lens_gpu,
-        req_pool_indices=req_pool_indices_int64,
-        dst_quant_slots=dst_quant_slots,
-        req_to_token=batch.req_to_token_pool.req_to_token,
-        flush_mask=flush_mask,
-        hp_prefix_tokens=kv_pool.hp_prefix_tokens,
-        hp_recent_tokens=kv_pool.hp_recent_tokens,
-        hp_global_offset=kv_pool.hp_global_offset,
-        flush_interval=flush_interval,
-    )
+            # Phase 1 (no-race with previous forward): plan kernel reads
+            # ``req_to_token`` and produces ``returned_slot_ids`` etc. Followed by
+            # ``allocator.free``, whose ``torch.unique`` host-syncs only against this
+            # short pre-wait prefix instead of the previous forward. See
+            # plan-for-a-fix-starry-russell.md.
+            plan = gpu_flush_int2_plan(
+                seq_lens=seq_lens_int32,
+                prefix_lens=prefix_lens_gpu,
+                req_pool_indices=req_pool_indices_int64,
+                dst_quant_slots=dst_quant_slots,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                flush_mask=flush_mask,
+                hp_prefix_tokens=kv_pool.hp_prefix_tokens,
+                hp_recent_tokens=kv_pool.hp_recent_tokens,
+                hp_global_offset=kv_pool.hp_global_offset,
+                flush_interval=flush_interval,
+            )
+            _mixed_kv_flush_profile_log("plan", flush_t0)
 
-    if plan is not None:
-        # Free everything returned by the kernel in one call: flushed HP
-        # slots (freed from HP tier) and unused quant slots from
-        # non-flushing requests (whole pages, since per-request
-        # all-or-nothing). The allocator decodes tier from each global slot
-        # id.
-        allocator.free(plan.returned_slot_ids)
+            if plan is not None and bs != 1:
+                free_t0 = (
+                    time.perf_counter() if _mixed_kv_flush_profile_enabled() else 0.0
+                )
+                # Free everything returned by the kernel in one call: flushed HP
+                # slots (freed from HP tier) and unused quant slots from
+                # non-flushing requests (whole pages, since per-request
+                # all-or-nothing). The allocator decodes tier from each global slot
+                # id.
+                allocator.free(plan.returned_slot_ids)
+                _mixed_kv_flush_profile_log("free", free_t0)
 
-    # Phase 2 (must wait): the apply kernels write ``req_to_token`` at
-    # positions inside the previous forward's read range. Order
-    # schedule_stream after ``forward_done`` here, not at the top of the
-    # event loop, so the host syncs above and any retract/eviction frees
-    # don't stall behind the previous forward.
-    wait_pending_forward = getattr(kv_pool, "wait_pending_forward", None)
-    if wait_pending_forward is not None:
-        wait_pending_forward()
+        # Phase 2 (must wait): the apply kernels write ``req_to_token`` at
+        # positions inside the previous forward's read range. Order
+        # schedule_stream after ``forward_done`` here, not at the top of the
+        # event loop, so the host syncs above and any retract/eviction frees
+        # don't stall behind the previous forward.
+        wait_pending_forward = getattr(kv_pool, "wait_pending_forward", None)
+        if wait_pending_forward is not None:
+            wait_t0 = time.perf_counter() if _mixed_kv_flush_profile_enabled() else 0.0
+            wait_pending_forward()
+            _mixed_kv_flush_profile_log("wait_forward", wait_t0)
 
-    if plan is not None:
-        gpu_flush_int2_apply(
-            plan,
-            req_pool_indices=req_pool_indices_int64,
-            req_to_token=batch.req_to_token_pool.req_to_token,
-            hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
-            hp_v_ptrs=kv_pool._flush_hp_v_ptrs,
-            quant_k_ptrs=kv_pool._flush_quant_k_ptrs,
-            quant_v_ptrs=kv_pool._flush_quant_v_ptrs,
-            k_sz_ptrs=kv_pool._flush_k_sz_ptrs,
-            v_sz_ptrs=kv_pool._flush_v_sz_ptrs,
-            hp_k_sample=kv_pool.hp_k_buffer[0],
-            hp_v_sample=kv_pool.hp_v_buffer[0],
-            quant_k_sample=kv_pool.k_buffer[0],
-            quant_v_sample=kv_pool.v_buffer[0],
-            k_sz_sample=kv_pool.k_scales_zeros[0],
-            v_sz_sample=kv_pool.v_scales_zeros[0],
-            hp_k_strides=kv_pool._flush_hp_k_stride,
-            hp_v_strides=kv_pool._flush_hp_v_stride,
-            quant_k_strides=kv_pool._flush_quant_k_stride,
-            quant_v_strides=kv_pool._flush_quant_v_stride,
-            k_sz_strides=kv_pool._flush_k_sz_stride,
-            v_sz_strides=kv_pool._flush_v_sz_stride,
-            num_heads=kv_pool.head_num,
-            head_dim=kv_pool.head_dim,
-            v_head_dim=kv_pool.v_head_dim,
-            k_num_scale_groups=kv_pool.k_num_scale_groups,
-            v_num_scale_groups=kv_pool.v_num_scale_groups,
-            num_layers=kv_pool.layer_num,
-            k_clip_ratio=kv_pool._k_clip_ratio,
-            v_clip_ratio=kv_pool._v_clip_ratio,
-        )
+        if use_dense_bs1_flush:
+            apply_t0 = time.perf_counter() if _mixed_kv_flush_profile_enabled() else 0.0
+            req_pool_idx = int(batch.reqs[0].req_pool_idx)
+            gpu_flush_int2_dense_bs1(
+                seq_len=int(batch.seq_lens_cpu[0].item()),
+                prefix_len=int(batch.reqs[0].cache_protected_len),
+                req_pool_idx=req_pool_idx,
+                next_slab_offset=kv_pool._next_slab_offset,
+                dst_quant_page=dst_quant_page,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
+                hp_v_ptrs=kv_pool._flush_hp_v_ptrs,
+                quant_k_ptrs=kv_pool._flush_quant_k_ptrs,
+                quant_v_ptrs=kv_pool._flush_quant_v_ptrs,
+                k_sz_ptrs=kv_pool._flush_k_sz_ptrs,
+                v_sz_ptrs=kv_pool._flush_v_sz_ptrs,
+                hp_k_sample=kv_pool.hp_k_buffer[0],
+                hp_v_sample=kv_pool.hp_v_buffer[0],
+                quant_k_sample=kv_pool.k_buffer[0],
+                quant_v_sample=kv_pool.v_buffer[0],
+                k_sz_sample=kv_pool.k_scales_zeros[0],
+                v_sz_sample=kv_pool.v_scales_zeros[0],
+                hp_k_strides=kv_pool._flush_hp_k_stride,
+                hp_v_strides=kv_pool._flush_hp_v_stride,
+                quant_k_strides=kv_pool._flush_quant_k_stride,
+                quant_v_strides=kv_pool._flush_quant_v_stride,
+                k_sz_strides=kv_pool._flush_k_sz_stride,
+                v_sz_strides=kv_pool._flush_v_sz_stride,
+                hp_recent_tokens=kv_pool.hp_recent_tokens,
+                hp_recent_ring_size=kv_pool.hp_recent_ring_size,
+                hp_recent_base=kv_pool.num_hp_prefix_slots,
+                hp_global_offset=kv_pool.hp_global_offset,
+                num_heads=kv_pool.head_num,
+                head_dim=kv_pool.head_dim,
+                v_head_dim=kv_pool.v_head_dim,
+                k_num_scale_groups=kv_pool.k_num_scale_groups,
+                v_num_scale_groups=kv_pool.v_num_scale_groups,
+                num_layers=kv_pool.layer_num,
+                flush_interval=flush_interval,
+                k_clip_ratio=kv_pool._k_clip_ratio,
+                v_clip_ratio=kv_pool._v_clip_ratio,
+            )
+            _mixed_kv_flush_profile_log("apply", apply_t0)
+            _mixed_kv_flush_profile_log("flush_total", flush_t0)
+        elif plan is not None:
+            apply_t0 = time.perf_counter() if _mixed_kv_flush_profile_enabled() else 0.0
+            gpu_flush_int2_apply(
+                plan,
+                req_pool_indices=req_pool_indices_int64,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
+                hp_v_ptrs=kv_pool._flush_hp_v_ptrs,
+                quant_k_ptrs=kv_pool._flush_quant_k_ptrs,
+                quant_v_ptrs=kv_pool._flush_quant_v_ptrs,
+                k_sz_ptrs=kv_pool._flush_k_sz_ptrs,
+                v_sz_ptrs=kv_pool._flush_v_sz_ptrs,
+                hp_k_sample=kv_pool.hp_k_buffer[0],
+                hp_v_sample=kv_pool.hp_v_buffer[0],
+                quant_k_sample=kv_pool.k_buffer[0],
+                quant_v_sample=kv_pool.v_buffer[0],
+                k_sz_sample=kv_pool.k_scales_zeros[0],
+                v_sz_sample=kv_pool.v_scales_zeros[0],
+                hp_k_strides=kv_pool._flush_hp_k_stride,
+                hp_v_strides=kv_pool._flush_hp_v_stride,
+                quant_k_strides=kv_pool._flush_quant_k_stride,
+                quant_v_strides=kv_pool._flush_quant_v_stride,
+                k_sz_strides=kv_pool._flush_k_sz_stride,
+                v_sz_strides=kv_pool._flush_v_sz_stride,
+                num_heads=kv_pool.head_num,
+                head_dim=kv_pool.head_dim,
+                v_head_dim=kv_pool.v_head_dim,
+                k_num_scale_groups=kv_pool.k_num_scale_groups,
+                v_num_scale_groups=kv_pool.v_num_scale_groups,
+                num_layers=kv_pool.layer_num,
+                k_clip_ratio=kv_pool._k_clip_ratio,
+                v_clip_ratio=kv_pool._v_clip_ratio,
+            )
+            _mixed_kv_flush_profile_log("apply", apply_t0)
+            _mixed_kv_flush_profile_log("flush_total", flush_t0)
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
@@ -950,6 +1104,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    release_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -963,7 +1118,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    cache_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+    _mixed_kv_cycle_profile_log("release_cache_finished_req", cache_t0)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
     # transfer KV ownership to the SessionSlot, so we skip the remaining
@@ -1008,6 +1165,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         release_slab(req.req_pool_idx)
 
     tree_cache.req_to_token_pool.free(req)
+    _mixed_kv_cycle_profile_log("release_kv_cache_total", release_t0)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

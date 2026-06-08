@@ -257,6 +257,27 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -2837,6 +2858,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
+            raw_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2844,6 +2866,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            _mixed_kv_cycle_profile_log("model_runner_forward_raw", raw_t0)
             elastic_ep_state = ElasticEPStateManager.instance()
             if (
                 elastic_ep_state is not None

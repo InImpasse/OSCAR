@@ -500,6 +500,174 @@ def _flush_remap_kernel(
     tl.store(req_to_token_ptr + req * rtt_stride_row + fp, dst)
 
 
+@triton.jit
+def _fused_flush_quant_ring_bs1_kernel(
+    # Per-layer base pointers (int64 addresses, one per layer).
+    hp_k_ptrs_ptr,
+    hp_v_ptrs_ptr,
+    quant_k_ptrs_ptr,
+    quant_v_ptrs_ptr,
+    k_sz_ptrs_ptr,
+    v_sz_ptrs_ptr,
+    hp_k_sample_ptr,
+    hp_v_sample_ptr,
+    quant_k_sample_ptr,
+    quant_v_sample_ptr,
+    k_sz_sample_ptr,
+    v_sz_sample_ptr,
+    dst_quant_page_ptr,          # int64 [1]
+    req_to_token_ptr,            # int32 [num_req_slots, max_ctx]
+    req_pool_idx,
+    seq_len,
+    prefix_len,
+    next_slab_offset_ptr,        # int32 [max_req_slots], already advanced by alloc
+    rtt_stride_row,
+    num_heads,
+    num_layers,
+    HP_K_STRIDE_LOC: tl.constexpr,
+    HP_K_STRIDE_HEAD: tl.constexpr,
+    HP_K_STRIDE_DIM: tl.constexpr,
+    HP_V_STRIDE_LOC: tl.constexpr,
+    HP_V_STRIDE_HEAD: tl.constexpr,
+    HP_V_STRIDE_DIM: tl.constexpr,
+    Q_K_STRIDE_LOC: tl.constexpr,
+    Q_K_STRIDE_HEAD: tl.constexpr,
+    Q_K_STRIDE_DIM: tl.constexpr,
+    Q_V_STRIDE_LOC: tl.constexpr,
+    Q_V_STRIDE_HEAD: tl.constexpr,
+    Q_V_STRIDE_DIM: tl.constexpr,
+    K_SZ_STRIDE_LOC: tl.constexpr,
+    K_SZ_STRIDE_HEAD: tl.constexpr,
+    K_SZ_STRIDE_DIM: tl.constexpr,
+    V_SZ_STRIDE_LOC: tl.constexpr,
+    V_SZ_STRIDE_HEAD: tl.constexpr,
+    V_SZ_STRIDE_DIM: tl.constexpr,
+    K_HEAD_DIM: tl.constexpr,
+    K_BLOCK_QUARTER: tl.constexpr,
+    K_NUM_GROUPS: tl.constexpr,
+    K_GROUP_SIZE: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    V_BLOCK_QUARTER: tl.constexpr,
+    V_NUM_GROUPS: tl.constexpr,
+    V_GROUP_SIZE: tl.constexpr,
+    BLOCK_TOK: tl.constexpr,
+    HP_RECENT_TOKENS: tl.constexpr,
+    HP_RECENT_RING_SIZE: tl.constexpr,
+    HP_RECENT_BASE: tl.constexpr,
+    HP_OFFSET: tl.constexpr,
+    FLUSH_INTERVAL: tl.constexpr,
+    K_CLIP_INDEX: tl.constexpr,
+    V_CLIP_INDEX: tl.constexpr,
+    K_BSEARCH_ITERS: tl.constexpr,
+    V_BSEARCH_ITERS: tl.constexpr,
+):
+    """Ring-derived bs=1 flush: derive source rows inside the quant kernel.
+
+    This avoids allocating plan tensors and avoids the sync-bearing
+    returned-slot free path. Source HP slots come from the HP-recent ring
+    cursor, so remap can be done by one program in the same kernel without
+    racing with source-slot reads from ``req_to_token``.
+    """
+    pid_tok = tl.program_id(0)
+    head = tl.program_id(1)
+    layer = tl.program_id(2)
+    if head >= num_heads or layer >= num_layers:
+        return
+
+    tok = pid_tok * BLOCK_TOK + tl.arange(0, BLOCK_TOK)
+    fp = seq_len - HP_RECENT_TOKENS - (FLUSH_INTERVAL - 1) + tok
+    tok_mask = tok < FLUSH_INTERVAL
+    active = tok_mask & (fp >= prefix_len) & (fp >= 0)
+    if tl.max(active.to(tl.int32), axis=0) == 0:
+        return
+
+    next_slab_offset = tl.load(next_slab_offset_ptr + req_pool_idx).to(tl.int64)
+    first_src = (next_slab_offset + HP_RECENT_RING_SIZE - 1) % HP_RECENT_RING_SIZE
+    src = req_pool_idx * HP_RECENT_RING_SIZE + HP_RECENT_BASE + (
+        (first_src + tok) % HP_RECENT_RING_SIZE
+    )
+    dst_page = tl.load(dst_quant_page_ptr).to(tl.int64)
+    dst = dst_page * FLUSH_INTERVAL + tok.to(tl.int64)
+    head64 = head.to(tl.int64)
+
+    hp_k_base = tl.load(hp_k_ptrs_ptr + layer).to(
+        tl.pointer_type(hp_k_sample_ptr.dtype.element_ty)
+    )
+    q_k_base = tl.load(quant_k_ptrs_ptr + layer).to(
+        tl.pointer_type(quant_k_sample_ptr.dtype.element_ty)
+    )
+    sz_k_base = tl.load(k_sz_ptrs_ptr + layer).to(
+        tl.pointer_type(k_sz_sample_ptr.dtype.element_ty)
+    )
+    _fused_flush_quant_body(
+        hp_k_base,
+        q_k_base,
+        sz_k_base,
+        src,
+        dst,
+        active,
+        head64,
+        HP_K_STRIDE_LOC,
+        HP_K_STRIDE_HEAD,
+        HP_K_STRIDE_DIM,
+        Q_K_STRIDE_LOC,
+        Q_K_STRIDE_HEAD,
+        Q_K_STRIDE_DIM,
+        K_SZ_STRIDE_LOC,
+        K_SZ_STRIDE_HEAD,
+        K_SZ_STRIDE_DIM,
+        K_HEAD_DIM,
+        K_BLOCK_QUARTER,
+        K_NUM_GROUPS,
+        K_GROUP_SIZE,
+        BLOCK_TOK,
+        K_CLIP_INDEX,
+        K_BSEARCH_ITERS,
+    )
+
+    hp_v_base = tl.load(hp_v_ptrs_ptr + layer).to(
+        tl.pointer_type(hp_v_sample_ptr.dtype.element_ty)
+    )
+    q_v_base = tl.load(quant_v_ptrs_ptr + layer).to(
+        tl.pointer_type(quant_v_sample_ptr.dtype.element_ty)
+    )
+    sz_v_base = tl.load(v_sz_ptrs_ptr + layer).to(
+        tl.pointer_type(v_sz_sample_ptr.dtype.element_ty)
+    )
+    _fused_flush_quant_body(
+        hp_v_base,
+        q_v_base,
+        sz_v_base,
+        src,
+        dst,
+        active,
+        head64,
+        HP_V_STRIDE_LOC,
+        HP_V_STRIDE_HEAD,
+        HP_V_STRIDE_DIM,
+        Q_V_STRIDE_LOC,
+        Q_V_STRIDE_HEAD,
+        Q_V_STRIDE_DIM,
+        V_SZ_STRIDE_LOC,
+        V_SZ_STRIDE_HEAD,
+        V_SZ_STRIDE_DIM,
+        V_HEAD_DIM,
+        V_BLOCK_QUARTER,
+        V_NUM_GROUPS,
+        V_GROUP_SIZE,
+        BLOCK_TOK,
+        V_CLIP_INDEX,
+        V_BSEARCH_ITERS,
+    )
+
+    if head == 0 and layer == 0:
+        tl.store(
+            req_to_token_ptr + req_pool_idx * rtt_stride_row + fp.to(tl.int64),
+            dst.to(tl.int32),
+            mask=active,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -711,6 +879,24 @@ def gpu_flush_int2_apply(
     # caller in the same bulk free as the valid flushes.
     safe_src_hp_slot = plan.src_hp_slot.clamp(min=0)
 
+    if int(plan.valid_mask.max().item()) == 0:
+        return
+
+    num_valid = int(plan.valid_mask.sum().item())
+    if num_valid < total_flush_slots:
+        valid_idx = torch.nonzero(plan.valid_mask, as_tuple=False).squeeze(-1)
+        quant_src = safe_src_hp_slot.index_select(0, valid_idx)
+        quant_dst = plan.dst_quant_slots.index_select(0, valid_idx)
+        quant_valid = torch.ones(
+            (num_valid,), dtype=torch.int8, device=plan.valid_mask.device
+        )
+        num_flush_tokens = num_valid
+    else:
+        quant_src = safe_src_hp_slot
+        quant_dst = plan.dst_quant_slots
+        quant_valid = plan.valid_mask
+        num_flush_tokens = total_flush_slots
+
     k_block_quarter, k_num_groups, k_group_size = _resolve_kv_quant_config(
         head_dim, k_num_scale_groups
     )
@@ -726,7 +912,7 @@ def gpu_flush_int2_apply(
         flush_interval, head_dim, elements_per_thread
     )
     grid = (
-        triton.cdiv(total_flush_slots, block_tok),
+        triton.cdiv(num_flush_tokens, block_tok),
         num_heads,
         int(num_layers),
     )
@@ -743,10 +929,10 @@ def gpu_flush_int2_apply(
         quant_v_sample,
         k_sz_sample,
         v_sz_sample,
-        safe_src_hp_slot,
-        plan.dst_quant_slots,
-        plan.valid_mask,
-        total_flush_slots,
+        quant_src,
+        quant_dst,
+        quant_valid,
+        num_flush_tokens,
         num_heads,
         int(num_layers),
         HP_K_STRIDE_LOC=hp_k_strides[0],
@@ -794,6 +980,141 @@ def gpu_flush_int2_apply(
         rtt_stride_row,
         FLUSH_INTERVAL=int(flush_interval),
         num_warps=1,
+        num_stages=1,
+    )
+
+
+def gpu_flush_int2_dense_bs1(
+    *,
+    seq_len: int,
+    prefix_len: int,
+    req_pool_idx: int,
+    next_slab_offset: torch.Tensor,
+    dst_quant_page: torch.Tensor,             # int64 [1]
+    req_to_token: torch.Tensor,               # int32 [num_req_slots, max_ctx]
+    hp_k_ptrs: torch.Tensor,
+    hp_v_ptrs: torch.Tensor,
+    quant_k_ptrs: torch.Tensor,
+    quant_v_ptrs: torch.Tensor,
+    k_sz_ptrs: torch.Tensor,
+    v_sz_ptrs: torch.Tensor,
+    hp_k_sample: torch.Tensor,
+    hp_v_sample: torch.Tensor,
+    quant_k_sample: torch.Tensor,
+    quant_v_sample: torch.Tensor,
+    k_sz_sample: torch.Tensor,
+    v_sz_sample: torch.Tensor,
+    hp_k_strides: Tuple[int, int, int],
+    hp_v_strides: Tuple[int, int, int],
+    quant_k_strides: Tuple[int, int, int],
+    quant_v_strides: Tuple[int, int, int],
+    k_sz_strides: Tuple[int, int, int],
+    v_sz_strides: Tuple[int, int, int],
+    hp_recent_tokens: int,
+    hp_recent_ring_size: int,
+    hp_recent_base: int,
+    hp_global_offset: int,
+    num_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    k_num_scale_groups: int,
+    v_num_scale_groups: int,
+    num_layers: int,
+    flush_interval: int,
+    k_clip_ratio: float = 0.0,
+    v_clip_ratio: float = 0.0,
+) -> None:
+    """Specialized dense flush for the hot bs=1 decode path.
+
+    The generic path materializes plan tensors, frees returned HP-recent
+    slots, then applies quant and remap. For a single flushing request all
+    returned slots are HP-recent slab slots, whose allocator free is a no-op.
+    This launcher derives source rows from the HP-recent ring cursor and lets
+    one quant-kernel program remap ``req_to_token`` after source ids are no
+    longer read from it.
+    """
+    assert dst_quant_page.dtype == torch.int64
+    assert dst_quant_page.numel() == 1
+    assert req_to_token.dtype == torch.int32
+
+    k_block_quarter, k_num_groups, k_group_size = _resolve_kv_quant_config(
+        head_dim, k_num_scale_groups
+    )
+    v_block_quarter, v_num_groups, v_group_size = _resolve_kv_quant_config(
+        v_head_dim, v_num_scale_groups
+    )
+    k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
+    v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
+    elements_per_thread = _flush_elements_per_thread(hp_k_sample.dtype)
+    block_tok, num_warps = _flush_block_tok_and_num_warps(
+        flush_interval, head_dim, elements_per_thread
+    )
+    rtt_stride_row = int(req_to_token.stride(0))
+
+    grid = (
+        triton.cdiv(int(flush_interval), block_tok),
+        int(num_heads),
+        int(num_layers),
+    )
+    _fused_flush_quant_ring_bs1_kernel[grid](
+        hp_k_ptrs,
+        hp_v_ptrs,
+        quant_k_ptrs,
+        quant_v_ptrs,
+        k_sz_ptrs,
+        v_sz_ptrs,
+        hp_k_sample,
+        hp_v_sample,
+        quant_k_sample,
+        quant_v_sample,
+        k_sz_sample,
+        v_sz_sample,
+        dst_quant_page,
+        req_to_token,
+        int(req_pool_idx),
+        int(seq_len),
+        int(prefix_len),
+        next_slab_offset,
+        rtt_stride_row,
+        int(num_heads),
+        int(num_layers),
+        HP_K_STRIDE_LOC=hp_k_strides[0],
+        HP_K_STRIDE_HEAD=hp_k_strides[1],
+        HP_K_STRIDE_DIM=hp_k_strides[2],
+        HP_V_STRIDE_LOC=hp_v_strides[0],
+        HP_V_STRIDE_HEAD=hp_v_strides[1],
+        HP_V_STRIDE_DIM=hp_v_strides[2],
+        Q_K_STRIDE_LOC=quant_k_strides[0],
+        Q_K_STRIDE_HEAD=quant_k_strides[1],
+        Q_K_STRIDE_DIM=quant_k_strides[2],
+        Q_V_STRIDE_LOC=quant_v_strides[0],
+        Q_V_STRIDE_HEAD=quant_v_strides[1],
+        Q_V_STRIDE_DIM=quant_v_strides[2],
+        K_SZ_STRIDE_LOC=k_sz_strides[0],
+        K_SZ_STRIDE_HEAD=k_sz_strides[1],
+        K_SZ_STRIDE_DIM=k_sz_strides[2],
+        V_SZ_STRIDE_LOC=v_sz_strides[0],
+        V_SZ_STRIDE_HEAD=v_sz_strides[1],
+        V_SZ_STRIDE_DIM=v_sz_strides[2],
+        K_HEAD_DIM=int(head_dim),
+        K_BLOCK_QUARTER=k_block_quarter,
+        K_NUM_GROUPS=k_num_groups,
+        K_GROUP_SIZE=k_group_size,
+        V_HEAD_DIM=int(v_head_dim),
+        V_BLOCK_QUARTER=v_block_quarter,
+        V_NUM_GROUPS=v_num_groups,
+        V_GROUP_SIZE=v_group_size,
+        BLOCK_TOK=block_tok,
+        HP_RECENT_TOKENS=int(hp_recent_tokens),
+        HP_RECENT_RING_SIZE=int(hp_recent_ring_size),
+        HP_RECENT_BASE=int(hp_recent_base),
+        HP_OFFSET=int(hp_global_offset),
+        FLUSH_INTERVAL=int(flush_interval),
+        K_CLIP_INDEX=k_clip_index,
+        V_CLIP_INDEX=v_clip_index,
+        K_BSEARCH_ITERS=(int(head_dim).bit_length() - 1) if head_dim >= 64 else 0,
+        V_BSEARCH_ITERS=(int(v_head_dim).bit_length() - 1) if v_head_dim >= 64 else 0,
+        num_warps=num_warps,
         num_stages=1,
     )
 

@@ -244,6 +244,28 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _mixed_kv_cycle_profile_enabled() -> bool:
+    return os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _mixed_kv_cycle_profile_log(label: str, t0: float) -> None:
+    if _mixed_kv_cycle_profile_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        min_ms = float(os.environ.get("SGLANG_MIXED_KV_CYCLE_PROFILE_MIN_MS", "10"))
+        if elapsed_ms < min_ms:
+            return
+        logger.info(
+            "mixed_kv_cycle_profile %s_ms=%.3f",
+            label,
+            elapsed_ms,
+        )
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -1393,27 +1415,38 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            loop_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
+            wait_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             self.maybe_wait_mixed_kv_forward_done()
+            _mixed_kv_cycle_profile_log("scheduler_maybe_wait_forward_done", wait_t0)
 
             # Receive requests
+            recv_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            _mixed_kv_cycle_profile_log("scheduler_recv_process", recv_t0)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            next_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            _mixed_kv_cycle_profile_log("scheduler_get_next_batch", next_t0)
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
+                pop_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
                 pop_and_process()
+                _mixed_kv_cycle_profile_log("scheduler_pop_process_pre", pop_t0)
 
             # Launch the current batch
             if batch:
+                run_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
                 batch_result = self.run_batch(batch)
+                _mixed_kv_cycle_profile_log("scheduler_run_batch", run_t0)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1422,7 +1455,9 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
+                    pop_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
                     pop_and_process()
+                    _mixed_kv_cycle_profile_log("scheduler_pop_process_post", pop_t0)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1430,12 +1465,15 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
+                sample_t0 = time.perf_counter() if _mixed_kv_cycle_profile_enabled() else 0.0
                 self.launch_batch_sample_if_needed(batch_result)
+                _mixed_kv_cycle_profile_log("scheduler_launch_sample", sample_t0)
 
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            _mixed_kv_cycle_profile_log("scheduler_overlap_loop_total", loop_t0)
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.

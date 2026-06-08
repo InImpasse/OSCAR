@@ -2429,8 +2429,12 @@ def decode_attention_fwd_int2_unified(
     quant_lse = attn_lse[:, :, hp_max_kv_splits:]
 
     kv_group_num = q.shape[1] // hp_k_buffer.shape[1]
+    run_hp = hp_kv_indices.numel() > 0
+    run_quant = quant_kv_indices.numel() > 0
 
-    if hp_kv_indices.numel() > 0:
+    def _launch_hp_stage1() -> None:
+        if not run_hp:
+            return
         if kv_group_num == 1:
             _decode_att_m_fwd(
                 q,
@@ -2462,7 +2466,9 @@ def decode_attention_fwd_int2_unified(
                 xai_temperature_len,
             )
 
-    if quant_kv_indices.numel() > 0:
+    def _launch_quant_stage1() -> None:
+        if not run_quant:
+            return
         if kv_group_num == 1:
             _decode_att_m_fwd_quant_int2(
                 q,
@@ -2497,6 +2503,25 @@ def decode_attention_fwd_int2_unified(
                 logit_cap,
                 xai_temperature_len,
             )
+
+    # Overlap HP and quant stage-1 when both tiers are active. Scratch slices
+    # are disjoint and q is read-only, so concurrent launches are safe.
+    # Skip overlap during CUDA graph capture (secondary streams invalidate capture).
+    can_overlap = (
+        run_hp
+        and run_quant
+        and q.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    if can_overlap:
+        quant_stream = torch.cuda.Stream(device=q.device)
+        with torch.cuda.stream(quant_stream):
+            _launch_quant_stage1()
+        _launch_hp_stage1()
+        torch.cuda.current_stream().wait_stream(quant_stream)
+    else:
+        _launch_hp_stage1()
+        _launch_quant_stage1()
 
     _unified_stage2(
         attn_logits,
