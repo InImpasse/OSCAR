@@ -18,12 +18,22 @@ GSM8K_URL = (
 )
 
 
+def _default_data_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[4]
+    return repo_root / ".cache" / "gsm8k_test.jsonl"
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key", default="EMPTY")
-    parser.add_argument("--data-path", type=Path, default=Path("/tmp/gsm8k_test.jsonl"))
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=None,
+        help="GSM8K test.jsonl path (default: <repo>/.cache/gsm8k_test.jsonl)",
+    )
     parser.add_argument("--num-examples", type=int, default=50)
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -92,6 +102,8 @@ def build_prompt(rows: list[dict], idx: int, num_shots: int) -> str:
 
 def main() -> int:
     args = build_argparser().parse_args()
+    if args.data_path is None:
+        args.data_path = _default_data_path()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):

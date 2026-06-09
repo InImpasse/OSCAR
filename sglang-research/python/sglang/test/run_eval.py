@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+from pathlib import Path
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -257,12 +258,16 @@ def run_eval(args):
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    output_dir = Path(os.environ.get("SGLANG_EVAL_OUTPUT_DIR", ".cache/sglang-eval"))
+    if not output_dir.is_absolute():
+        output_dir = Path.cwd() / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_filename = output_dir / f"{file_stem}.html"
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
+    result_filename = output_dir / f"{file_stem}.json"
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
