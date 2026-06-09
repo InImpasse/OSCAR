@@ -333,11 +333,7 @@ class UnifiedInt2HPKVAllocator(BaseTokenToKVPoolAllocator):
         is_quant = idx < self._hp_offset
         quant_index = idx[is_quant]
         if quant_index.numel() > 0:
-            if quant_index.numel() <= self.N_Q:
-                # Single-request decode flush returns at most one quant page.
-                quant_pages = (quant_index[0:1] // self.N_Q).to(torch.int64)
-            else:
-                quant_pages = torch.unique((quant_index // self.N_Q).to(torch.int64))
+            quant_pages = torch.unique((quant_index // self.N_Q).to(torch.int64))
             if self.need_sort:
                 self.release_pages = torch.cat([quant_pages, self.release_pages])
             else:
