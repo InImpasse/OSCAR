@@ -46,6 +46,8 @@ GRADER_PATTERNS = {
     "aime2025": r'\boxed{(\d+)}|\b(\d+)\b',
     "aime2026": r'\boxed{(\d+)}|\b(\d+)\b',
     "gsm8k": r'\b(\d+)\b',
+    "gpqa": r'(?:Answer\s*:\s*)?([ABCD])\b',
+    "math500": r'\\boxed{([^}]+)}|\b(-?\d+(?:\.\d+)?)\b',
 }
 
 SAMPLE_ANSWERS = {
@@ -73,6 +75,11 @@ SAMPLE_ANSWERS = {
         "A",
         "D",
         "C"
+    ],
+    "math500": [
+        "42",
+        "\\frac{1}{2}",
+        "x=3"
     ],
 }
 
@@ -107,6 +114,15 @@ B) {B}
 C) {C}
 D) {D}
 """,
+    "math500": """Solve the following math problem step by step. Put your final answer inside \\boxed{{}}.
+
+{question}
+
+Remember to put your final answer inside \\boxed{{}}.
+""",
+    "humaneval": """Complete the following Python function. Return only valid Python code for the completion.
+
+{prompt}""",
 }
 
 
@@ -186,6 +202,10 @@ class EvalState:
             self.dataset = Gsm8kDataset()
         elif self.dataset_type == "gpqa":
             self.dataset = GpqaDataset(variant="diamond", seed=seed)
+        elif self.dataset_type == "math500":
+            self.dataset = Math500Dataset()
+        elif self.dataset_type == "humaneval":
+            self.dataset = HumanEvalDataset()
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
 
@@ -577,7 +597,9 @@ class EvalState:
         with open(html_file, "w") as f:
             f.write(html_content)
 
-    def _escape_html(self, s: str) -> str:
+    def _escape_html(self, s: Optional[str]) -> str:
+        if s is None:
+            return ""
         return (s.replace("&", "&amp;")
                    .replace("<", "&lt;")
                    .replace(">", "&gt;")
@@ -694,6 +716,15 @@ def normalize_number(s: str) -> Optional[int]:
     if not match:
         return None
     return int(match.group(0))
+
+def normalize_math_answer(s: str) -> str:
+    out = str(s).strip()
+    out = out.replace("\\left", "").replace("\\right", "")
+    out = out.replace("$", "").replace(",", "")
+    out = re.sub(r"\s+", "", out)
+    if out.startswith("\\boxed{") and out.endswith("}"):
+        out = out[len("\\boxed{"):-1]
+    return out.strip().strip(".")
 
 class AimeDataset(BaseDataset):
     def __init__(self, split: str = "train"):
@@ -974,6 +1005,69 @@ class GpqaDataset(BaseDataset):
             D=question["shuffled_answers"][3]
         )
 
+class Math500Dataset(BaseDataset):
+    def __init__(self):
+        self.questions = []
+        self._load_dataset()
+
+    def _load_dataset(self):
+        print("Loading MATH-500 dataset...")
+        from datasets import load_dataset
+
+        ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        self.questions = []
+        for row in ds:
+            question = dict(row)
+            question["dataset_type"] = "math500"
+            self.questions.append(question)
+        print(f"MATH-500 dataset loaded: {len(self.questions)} questions")
+
+    def get_question(self, index: int) -> Dict:
+        return self.questions[index]
+
+    def get_question_text(self, question: Dict) -> str:
+        return question.get("problem", question.get("question", ""))
+
+    def get_answer(self, question: Dict) -> str:
+        return str(question.get("answer", "")).strip()
+
+    def get_prompt(self, question: Dict) -> str:
+        return TEMPLATE_REGISTRY["math500"].format(question=self.get_question_text(question))
+
+class HumanEvalDataset(BaseDataset):
+    def __init__(self):
+        self.questions = []
+        self._load_dataset()
+
+    def _load_dataset(self):
+        print("Loading HumanEval dataset...")
+        try:
+            from human_eval.data import read_problems
+        except Exception as exc:
+            raise RuntimeError(
+                "HumanEval requires the human-eval package. Install with "
+                "`python3 -m pip install git+https://github.com/openai/human-eval.git`."
+            ) from exc
+        problems = read_problems()
+        self.questions = []
+        for task_id in sorted(problems):
+            question = dict(problems[task_id])
+            question["dataset_type"] = "humaneval"
+            self.questions.append(question)
+        print(f"HumanEval dataset loaded: {len(self.questions)} questions")
+
+    def get_question(self, index: int) -> Dict:
+        return self.questions[index]
+
+    def get_question_text(self, question: Dict) -> str:
+        return question["prompt"]
+
+    def get_answer(self, question: Dict) -> str:
+        return question["task_id"]
+
+    def get_prompt(self, question: Dict) -> str:
+        return TEMPLATE_REGISTRY["humaneval"].format(prompt=question["prompt"])
+
 class Grader:
     def __init__(
         self,
@@ -998,6 +1092,15 @@ class Grader:
     def _extract_answer_regex(self, pred: str) -> Optional[str]:
         """Extract answer using regex pattern"""
         if not self.pattern:
+            return None
+
+        if self.dataset_type == "gpqa":
+            answer_matches = re.findall(r'(?:^|\n)\s*Answer\s*:\s*([ABCD])\b', pred)
+            if answer_matches:
+                return answer_matches[-1].strip()
+            standalone_matches = re.findall(r'(?:^|\n)\s*([ABCD])\s*$', pred)
+            if standalone_matches:
+                return standalone_matches[-1].strip()
             return None
 
         # For AIME datasets, prioritize boxed answers
@@ -1028,8 +1131,29 @@ class Grader:
         answer = self._extract_answer_regex(pred)
         if answer is None:
             return False, None
+        if self.dataset_type == "math500":
+            return normalize_math_answer(answer) == normalize_math_answer(gold), answer
         is_correct = answer.strip() == gold.strip()
         return is_correct, answer
+
+    def _grade_humaneval(self, gold: str, pred: str, problem: str) -> Tuple[bool, Optional[str]]:
+        try:
+            from human_eval.data import read_problems
+            from human_eval.execution import check_correctness
+        except Exception as exc:
+            raise RuntimeError(
+                "HumanEval grading requires the human-eval package."
+            ) from exc
+        problems = read_problems()
+        if gold not in problems:
+            return False, None
+        completion = pred
+        if completion.startswith(problem):
+            completion = completion[len(problem):]
+        completion = completion.split("```")[0]
+        sample = {"task_id": gold, "completion": completion}
+        result = check_correctness(problems[gold], sample, timeout=10.0)
+        return bool(result.get("passed")), "passed" if result.get("passed") else result.get("result")
 
     def _grade_cli(self, gold: str, pred: str) -> Tuple[bool, Optional[str]]:
         """Grade using external CLI script"""
@@ -1104,6 +1228,8 @@ Please provide only the extracted answer, nothing else. If there is no clear ans
 
     def grade(self, gold: str, pred: str, problem: str = "") -> Tuple[bool, Optional[str]]:
         """Grade the response"""
+        if self.dataset_type == "humaneval":
+            return self._grade_humaneval(gold, pred, problem)
         if self.grader_type == "regex":
             return self._grade_regex(gold, pred)
         elif self.grader_type == "cli":
@@ -1127,10 +1253,16 @@ class Processor:
         self.n_predict = n_predict
 
     @staticmethod
+    def _requests_session() -> requests.Session:
+        session = requests.Session()
+        session.trust_env = False
+        return session
+
+    @staticmethod
     def _check_server(server_config: ServerConfig) -> List[str]:
         url = f"{server_config.url}/v1/models"
         try:
-            response = requests.get(url)
+            response = Processor._requests_session().get(url)
             response.raise_for_status()
             models = [m["id"] for m in response.json().get("data", [])]
             return models
@@ -1157,7 +1289,7 @@ class Processor:
         if eval_state.sampling_config.get("min_p") is not None:
             data["min_p"] = eval_state.sampling_config["min_p"]
 
-        response = requests.post(url, headers=headers, json=data)
+        response = self._requests_session().post(url, headers=headers, json=data)
         response.raise_for_status()
         result = response.json()
         tokens = result.get("usage", {}).get("completion_tokens", 0)
@@ -1197,7 +1329,7 @@ class Processor:
             task_state.t_gen_ms = t_gen_ms
             task_state.reasoning_content = reasoning_content
 
-            if finish_reason != "stop":
+            if finish_reason not in {"stop", "length"}:
                 task_state.status = f"error: finish_reason={finish_reason}"
                 eval_state.add_result(
                     task_id, prompt, expected, result, None,
@@ -1213,7 +1345,8 @@ class Processor:
 
             grader_log = {
                 "pred": result_truncated,
-                "grader_type": self.grader.grader_type
+                "grader_type": self.grader.grader_type,
+                "finish_reason": finish_reason,
             }
             if self.grader.grader_type == "regex" and self.grader.pattern:
                 grader_log["pattern"] = self.grader.pattern
@@ -1362,7 +1495,7 @@ def main():
         "--dataset",
         type=str,
         default="aime",
-        choices=["aime", "aime2025", "aime2026", "gsm8k", "gpqa"],
+        choices=["aime", "aime2025", "aime2026", "gsm8k", "gpqa", "math500", "humaneval"],
         help="Dataset type (default: aime)"
     )
     parser.add_argument(
@@ -1484,11 +1617,6 @@ def main():
         ServerConfig(url=url, threads=threads, name=name)
         for url, threads, name in zip(server_urls, thread_counts, server_names)
     ]
-
-    if args.dataset == "gpqa" and args.grader_type != "llm":
-        print("Error: GPQA dataset requires --grader-type llm")
-        parser.print_help()
-        sys.exit(1)
 
     if args.output.exists():
         print(f"Loading existing eval state from {args.output}")
