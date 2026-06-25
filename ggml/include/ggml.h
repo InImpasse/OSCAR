@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant/OSCAR 2-bit KV cache: 128-value block + L2 norm
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: 32-value block + L2 norm
+        GGML_TYPE_OSCAR2_KV = 45, // OSCAR INT2 KV cache: one type, K/V-specific quant/dequant in KV paths
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
@@ -556,7 +559,6 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
-        GGML_OP_FLASH_ATTN_EXT_Q2_0_F16,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2418,7 +2420,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    GGML_API struct ggml_tensor * ggml_flash_attn_ext_q2_0_f16(
+    // OSCAR mixed-precision (two-tier KV) fused flash attention.
+    // Computes one joint online softmax over an LP tier (src[1..3]) and an
+    // HP tier (src[5..7]); src[4] remains reserved for attention sinks.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_mixed(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k_lp,
@@ -2427,7 +2432,22 @@ extern "C" {
             struct ggml_tensor  * k_hp,
             struct ggml_tensor  * v_hp,
             struct ggml_tensor  * mask_hp,
-            float                 scale);
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_mixed_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * lp_out,
+            struct ggml_tensor  * lp_meta,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_lp,
+            struct ggml_tensor  * mask_lp,
+            struct ggml_tensor  * k_hp,
+            struct ggml_tensor  * v_hp,
+            struct ggml_tensor  * mask_hp,
+            float                 scale,
+            float                 logit_softcap);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

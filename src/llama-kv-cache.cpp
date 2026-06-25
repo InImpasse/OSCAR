@@ -117,7 +117,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(4u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(5u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -144,6 +144,13 @@ llama_kv_cache::llama_kv_cache(
         n_kv_sink   = env_sink   ? (uint32_t)atoi(env_sink)   : 0;
         n_kv_recent = env_recent ? (uint32_t)atoi(env_recent) : 0;
         n_hp_total  = n_kv_sink + n_kv_recent;
+        if (n_hp_total > 0) {
+            const char * env_alloc_pad = getenv("LLAMA_KV_HP_ALLOC_PAD");
+            const uint32_t hp_alloc_pad = env_alloc_pad ? (uint32_t)std::max(1, atoi(env_alloc_pad)) : 1u;
+            if (hp_alloc_pad > 1) {
+                n_hp_total = GGML_PAD(n_hp_total, hp_alloc_pad);
+            }
+        }
         if (n_hp_total > 0) {
             LLAMA_LOG_INFO("%s: HP prefix+recent buffer: sink=%u, recent=%u, total=%u (F16)\n",
                     __func__, n_kv_sink, n_kv_recent, n_hp_total);
@@ -328,9 +335,12 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+    const char * LLAMA_KV_NO_HADAMARD = getenv("LLAMA_KV_NO_HADAMARD");
+    const bool attn_rot_disable =
+        (LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false) ||
+        (LLAMA_KV_NO_HADAMARD   ? atoi(LLAMA_KV_NO_HADAMARD)   : false);
     if (attn_rot_disable) {
-        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+        LLAMA_LOG_WARN("%s: attention Hadamard rotation force disabled\n", __func__);
     }
 
     attn_rot_k =
@@ -1099,6 +1109,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 }
             }
         }
+
     }
 
     return res;
@@ -1328,6 +1339,52 @@ uint32_t llama_kv_cache::get_n_hp_kv(const slot_info & sinfo) const {
     return hp_cells.used_max_p1();
 }
 
+uint32_t llama_kv_cache::get_n_hp_view(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (n_hp_total == 0) {
+        return 0;
+    }
+
+    const uint32_t hp_pad = getenv("LLAMA_KV_HP_PAD") ? std::max(1, atoi(getenv("LLAMA_KV_HP_PAD"))) : 256u;
+    const uint32_t n_hp_kv = get_n_hp_kv(sinfo);
+
+    const char * env_tight = getenv("LLAMA_KV_HP_VIEW_TIGHT");
+    if (env_tight == nullptr || env_tight[0] == '\0' || env_tight[0] == '0' || ubatch.n_tokens == 0) {
+        return std::min(n_hp_total, std::max(hp_pad, GGML_PAD(n_hp_kv, hp_pad)));
+    }
+
+    uint32_t tight_max_p1 = n_kv_sink > 0 ? std::min(n_hp_kv, n_kv_sink) : 0u;
+    llama_pos max_pos = -1;
+
+    if (n_kv_recent > 0) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_pos p = ubatch.pos[i];
+            if (p < 0) {
+                continue;
+            }
+            max_pos = std::max(max_pos, p);
+
+            const uint32_t recent_slot_p1 = n_kv_sink + ((uint32_t) p % n_kv_recent) + 1;
+            tight_max_p1 = std::max(tight_max_p1, recent_slot_p1);
+        }
+    }
+
+    if (max_pos >= (llama_pos) n_kv_recent) {
+        return std::min(n_hp_total, std::max(hp_pad, GGML_PAD(n_hp_kv, hp_pad)));
+    }
+
+    // Before the first ring wrap, all visible recent slots are compact below
+    // the current maximum slot.  This cuts early prefill HP-only work without
+    // changing the causal mask semantics.
+    tight_max_p1 = std::max(tight_max_p1, n_kv_sink);
+
+    const uint32_t n_hp_view = std::min(n_hp_total, std::max(hp_pad, GGML_PAD(tight_max_p1, hp_pad)));
+    if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+        fprintf(stderr, "hp_view: tight=1 used=%u tight_max=%u view=%u total=%u pad=%u n_tokens=%u\n",
+                n_hp_kv, tight_max_p1, n_hp_view, n_hp_total, hp_pad, ubatch.n_tokens);
+    }
+    return n_hp_view;
+}
+
 ggml_tensor * llama_kv_cache::get_k_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const {
     GGML_ASSERT(n_hp_total > 0);
     const int32_t ikv = map_layer_ids.at(il);
@@ -1394,6 +1451,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
     }
 
+    ggml_format_name(k_cur, "cache_k_set_rows_src_l%d", il);
+
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
@@ -1435,6 +1494,8 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
+        ggml_format_name(v_cur, "cache_v_set_rows_src_l%d", il);
+
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
     }
 
@@ -1455,6 +1516,8 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     ggml_tensor * v_view = ggml_reshape_2d(ctx, v, 1, ggml_nelements(v));
 
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
+
+    ggml_format_name(v_cur, "cache_v_set_rows_src_l%d", il);
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
@@ -2854,6 +2917,16 @@ uint32_t llama_kv_cache_context::get_n_hp_kv() const {
     return kv->get_n_hp_kv(sinfos[i_cur]);
 }
 
+uint32_t llama_kv_cache_context::get_n_hp_view() const {
+    if (!kv || kv->get_n_hp() == 0 || ubatches.empty()) return 0;
+    return kv->get_n_hp_view(sinfos[i_cur], ubatches[i_cur]);
+}
+
+uint32_t llama_kv_cache_context::get_n_hp_view(const llama_ubatch & ubatch) const {
+    if (!kv || kv->get_n_hp() == 0) return 0;
+    return kv->get_n_hp_view(sinfos[i_cur], ubatch);
+}
+
 uint32_t llama_kv_cache_context::get_n_hp_batch() const {
     if (!kv || kv->get_n_hp() == 0) return 0;
     const auto & sinfo = sinfos[i_cur];
@@ -2865,12 +2938,12 @@ uint32_t llama_kv_cache_context::get_n_hp_batch() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_hp(ggml_context * ctx, int32_t il) const {
-    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    const uint32_t n_hp_kv = get_n_hp_view();
     return kv->get_k_hp(ctx, il, n_hp_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v_hp(ggml_context * ctx, int32_t il) const {
-    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    const uint32_t n_hp_kv = get_n_hp_view();
     return kv->get_v_hp(ctx, il, n_hp_kv, sinfos[i_cur]);
 }
 
@@ -2886,12 +2959,12 @@ ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx)
     if (ubatches.empty()) {
         return nullptr;
     }
-    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    const uint32_t n_hp_kv = get_n_hp_view();
     return kv->build_input_hp_kq_mask(ctx, ubatches[i_cur], n_hp_kv);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    const uint32_t n_hp_kv = std::min(kv->get_n_hp(), std::max(256u, GGML_PAD(get_n_hp_kv(), 256u)));
+    const uint32_t n_hp_kv = get_n_hp_view(ubatch);
     return kv->build_input_hp_kq_mask(ctx, ubatch, n_hp_kv);
 }
 

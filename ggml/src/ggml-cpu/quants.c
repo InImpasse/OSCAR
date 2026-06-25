@@ -26,6 +26,10 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+void quantize_row_oscar2_kv(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_oscar2_kv_ref(x, y, k);
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }
@@ -202,6 +206,19 @@ static int q2_0_skip_hadamard(void) {
     return v;
 }
 
+static inline float oscar2_k_centroid_cpu(const int q) {
+    switch (q & 0x07) {
+        case 0:  return OSCAR2_K_C0;
+        case 1:  return OSCAR2_K_C1;
+        case 2:  return OSCAR2_K_C2;
+        case 3:  return OSCAR2_K_C3;
+        case 4:  return OSCAR2_K_C4;
+        case 5:  return OSCAR2_K_C5;
+        case 6:  return OSCAR2_K_C6;
+        default: return OSCAR2_K_C7;
+    }
+}
+
 void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK2_0 == 0);
     assert(nrc == 1);
@@ -281,6 +298,41 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
             }
             sumf += dot;
 #endif
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_oscar2_kv_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_OSCAR2_KV == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const int nb = n / QK_OSCAR2_KV;
+    const block_oscar2_kv * GGML_RESTRICT x = vx;
+    const block_q8_0      * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float xm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+            const uint8_t packed = x[ib].qs[j];
+            const uint8_t high = x[ib].rs[j];
+
+            for (int b = 0; b < 4; ++b) {
+                const int idx = j * 4 + b;
+                GGML_UNUSED(xm);
+                const int q = ((packed >> (2 * b)) & 0x03) | (((high >> (2 * b)) & 0x03) << 2);
+                const float xv = xd * ((float) q - 8.0f);
+
+                const block_q8_0 * GGML_RESTRICT yb = &y[(ib * QK_OSCAR2_KV + idx) / QK8_0];
+                const int yi = (ib * QK_OSCAR2_KV + idx) % QK8_0;
+                const float yv = GGML_CPU_FP16_TO_FP32(yb->d) * (float) yb->qs[yi];
+                sumf += xv * yv;
+            }
         }
     }
 

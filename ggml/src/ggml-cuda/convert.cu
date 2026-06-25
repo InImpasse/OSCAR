@@ -5,6 +5,91 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+static __device__ __forceinline__ float oscar2_convert_k_centroid(const int q) {
+    switch (q & 0x07) {
+        case 0: return OSCAR2_K_C0;
+        case 1: return OSCAR2_K_C1;
+        case 2: return OSCAR2_K_C2;
+        case 3: return OSCAR2_K_C3;
+        case 4: return OSCAR2_K_C4;
+        case 5: return OSCAR2_K_C5;
+        case 6: return OSCAR2_K_C6;
+        default: return OSCAR2_K_C7;
+    }
+}
+
+static __device__ __forceinline__ float oscar2_convert_v_centroid(const int q) {
+    switch (q & 0x07) {
+        case 0: return OSCAR2_V3_C0;
+        case 1: return OSCAR2_V3_C1;
+        case 2: return OSCAR2_V3_C2;
+        case 3: return OSCAR2_V3_C3;
+        case 4: return OSCAR2_V3_C4;
+        case 5: return OSCAR2_V3_C5;
+        case 6: return OSCAR2_V3_C6;
+        default: return OSCAR2_V3_C7;
+    }
+}
+
+template <bool is_k>
+static __global__ void dequantize_row_oscar2_kv_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+    const block_oscar2_kv * x = (const block_oscar2_kv *) vx;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t ib = i / QK_OSCAR2_KV;
+    const int iq = i % QK_OSCAR2_KV;
+    const block_oscar2_kv & b = x[ib];
+    const uint8_t qs = b.qs[iq / 4];
+    const uint8_t rs = b.rs[iq / 8];
+    const int q = ((qs >> (2 * (iq & 3))) & 0x03) | (((rs >> (iq & 7)) & 0x01) << 2);
+    const float d = __half2float(b.d);
+    const float m = __half2float(b.m);
+    const float v = is_k ? m + d * oscar2_convert_k_centroid(q) :
+        m + d * oscar2_convert_v_centroid(q);
+    y[i] = __float2half(v);
+}
+
+template <bool is_k>
+static __global__ void dequantize_row_oscar2_kv_f16_blockwise(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+    const block_oscar2_kv * x = (const block_oscar2_kv *) vx;
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int tid = threadIdx.x;
+    const int64_t i = ib * QK_OSCAR2_KV + tid;
+    if (tid >= QK_OSCAR2_KV || i >= k) {
+        return;
+    }
+
+    const block_oscar2_kv & b = x[ib];
+    const uint8_t qs = b.qs[tid / 4];
+    const uint8_t rs = b.rs[tid / 8];
+    const int q = ((qs >> (2 * (tid & 3))) & 0x03) | (((rs >> (tid & 7)) & 0x01) << 2);
+    const float d = __half2float(b.d);
+    const float m = __half2float(b.m);
+    const float v = is_k ? m + d * oscar2_convert_k_centroid(q) :
+        m + d * oscar2_convert_v_centroid(q);
+    y[i] = __float2half(v);
+}
+
+template <bool is_k>
+void dequantize_row_oscar2_kv_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const char * scalar_env = getenv("LLAMA_KV_OSCAR2_DEQUANT_SCALAR");
+    if (scalar_env && scalar_env[0] != '\0' && scalar_env[0] != '0') {
+        const int threads = CUDA_DEQUANTIZE_BLOCK_SIZE;
+        const int blocks = (k + threads - 1) / threads;
+        dequantize_row_oscar2_kv_f16<is_k><<<blocks, threads, 0, stream>>>(vx, y, k);
+    } else {
+        const int threads = QK_OSCAR2_KV;
+        const int blocks = (k + QK_OSCAR2_KV - 1) / QK_OSCAR2_KV;
+        dequantize_row_oscar2_kv_f16_blockwise<is_k><<<blocks, threads, 0, stream>>>(vx, y, k);
+    }
+}
+
+template void dequantize_row_oscar2_kv_f16_cuda<true>(const void *, half *, int64_t, cudaStream_t);
+template void dequantize_row_oscar2_kv_f16_cuda<false>(const void *, half *, int64_t, cudaStream_t);
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,

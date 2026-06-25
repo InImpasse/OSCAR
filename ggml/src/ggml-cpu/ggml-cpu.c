@@ -227,6 +227,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_OSCAR2_KV] = {
+        .from_float               = quantize_row_oscar2_kv,
+        .vec_dot                  = ggml_vec_dot_oscar2_kv_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_COUNT,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_COUNT,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q1_0] = {
         .from_float               = quantize_row_q1_0,
         .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
@@ -1993,10 +2011,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
-            } break;
-        case GGML_OP_FLASH_ATTN_EXT_Q2_0_F16:
-            {
-                GGML_ABORT("GGML_OP_FLASH_ATTN_EXT_Q2_0_F16 is CUDA-only");
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {

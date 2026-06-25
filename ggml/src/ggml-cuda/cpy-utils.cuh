@@ -73,6 +73,163 @@ static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, blo
     }
 }
 
+template<uint8_t (*quantize)(float, float), bool use_high_bit>
+static __device__ void quantize_f32_oscar2_block(const float * __restrict__ x, block_oscar2_kv * __restrict__ y) {
+    float mean = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        mean += x[j];
+    }
+    mean /= QK_OSCAR2_KV;
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        const float v = x[j] - mean;
+        sum_sq += v * v;
+    }
+
+    const float sigma = sqrtf(sum_sq / QK_OSCAR2_KV);
+    const float inv_sigma = sigma > 1e-8f ? 1.0f / sigma : 0.0f;
+    y->d = sigma;
+    y->m = mean;
+
+    for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+        uint8_t packed = 0;
+        for (int b = 0; b < 4; ++b) {
+            const uint8_t q = quantize(x[j * 4 + b] - mean, inv_sigma);
+            packed |= (q & 0x03) << (2 * b);
+        }
+        y->qs[j] = packed;
+    }
+
+    for (int j = 0; j < QK_OSCAR2_KV / 8; ++j) {
+        uint8_t packed = 0;
+        if constexpr (use_high_bit) {
+            for (int b = 0; b < 8; ++b) {
+                const int idx = j * 8 + b;
+                const uint8_t q = quantize(x[idx] - mean, inv_sigma);
+                packed |= ((q >> 2) & 0x01) << b;
+            }
+        }
+        y->rs[j] = packed;
+    }
+}
+
+static __device__ void quantize_f32_oscar2_k_block(const float * __restrict__ x, block_oscar2_kv * __restrict__ y) {
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        sum_sq += x[j] * x[j];
+    }
+
+    const float d  = sqrtf(sum_sq / QK_OSCAR2_KV);
+    const float id = d > 1e-8f ? 1.0f / d : 0.0f;
+    y->d = d;
+    y->m = 0.0f;
+
+    for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+        y->qs[j] = 0;
+    }
+    for (int j = 0; j < QK_OSCAR2_KV / 8; ++j) {
+        y->rs[j] = 0;
+    }
+
+    for (int idx = 0; idx < QK_OSCAR2_KV; ++idx) {
+        const float v = x[idx] * id;
+        int q = 0;
+        float best = fabsf(v - oscar2_centroid_3bit_cuda(0));
+        for (int qi = 1; qi < 8; ++qi) {
+            const float err = fabsf(v - oscar2_centroid_3bit_cuda(qi));
+            if (err < best) {
+                best = err;
+                q = qi;
+            }
+        }
+        y->qs[idx / 4] |= (q & 0x03) << (2 * (idx % 4));
+        y->rs[idx / 8] |= ((q >> 2) & 0x01) << (idx % 8);
+    }
+}
+
+static __device__ void quantize_f32_oscar2_k_residual_block(const float * __restrict__ x, block_oscar2_kv * __restrict__ y) {
+    float mean = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        mean += x[j];
+    }
+    mean /= QK_OSCAR2_KV;
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        const float v = x[j] - mean;
+        sum_sq += v * v;
+    }
+
+    const float d  = sqrtf(sum_sq / QK_OSCAR2_KV);
+    const float id = d > 1e-8f ? 1.0f / d : 0.0f;
+    y->d = d;
+    y->m = mean;
+
+    for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+        y->qs[j] = 0;
+    }
+    for (int j = 0; j < QK_OSCAR2_KV / 8; ++j) {
+        y->rs[j] = 0;
+    }
+
+    for (int idx = 0; idx < QK_OSCAR2_KV; ++idx) {
+        const float v = (x[idx] - mean) * id;
+        int q = 0;
+        float best = fabsf(v - oscar2_centroid_3bit_cuda(0));
+        for (int qi = 1; qi < 8; ++qi) {
+            const float err = fabsf(v - oscar2_centroid_3bit_cuda(qi));
+            if (err < best) {
+                best = err;
+                q = qi;
+            }
+        }
+        y->qs[idx / 4] |= (q & 0x03) << (2 * (idx % 4));
+        y->rs[idx / 8] |= ((q >> 2) & 0x01) << (idx % 8);
+    }
+}
+
+static __device__ void quantize_f32_oscar2_v_block(const float * __restrict__ x, block_oscar2_kv * __restrict__ y) {
+    float mean = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        mean += x[j];
+    }
+    mean /= QK_OSCAR2_KV;
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+        const float v = x[j] - mean;
+        sum_sq += v * v;
+    }
+
+    const float d  = sqrtf(sum_sq / QK_OSCAR2_KV);
+    const float id = d > 1e-8f ? 1.0f / d : 0.0f;
+    y->d = d;
+    y->m = mean;
+
+    for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+        y->qs[j] = 0;
+    }
+    for (int j = 0; j < QK_OSCAR2_KV / 8; ++j) {
+        y->rs[j] = 0;
+    }
+
+    for (int idx = 0; idx < QK_OSCAR2_KV; ++idx) {
+        const float v = (x[idx] - mean) * id;
+        int q = 0;
+        float best = fabsf(v - oscar2_v_centroid_3bit_cuda(0));
+        for (int qi = 1; qi < 8; ++qi) {
+            const float err = fabsf(v - oscar2_v_centroid_3bit_cuda(qi));
+            if (err < best) {
+                best = err;
+                q = qi;
+            }
+        }
+        y->qs[idx / 4] |= (q & 0x03) << (2 * (idx % 4));
+        y->rs[idx / 8] |= ((q >> 2) & 0x01) << (idx % 8);
+    }
+}
+
 static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, block_q4_1 * __restrict__ y) {
     float vmin = FLT_MAX;
     float vmax = -FLT_MAX;

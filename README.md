@@ -5,7 +5,7 @@ cache** with the **OSCAR calibrated rotation**, so a 4B thinking model can run a
 with a tiny KV footprint — targeting edge / MacBook deployment.
 
 On GPQA-Diamond with **Qwen3-4B-Thinking-2507**, full **K+V INT2 + OSCAR** recovers **f16-level
-accuracy** (sglang's OSCAR INT2 reference is ~62%).
+accuracy** (external OSCAR INT2 reference is ~62%).
 
 > Base project docs (build options, general usage, supported backends) are upstream
 > [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — preserved here as
@@ -24,7 +24,7 @@ Full chain-of-thought (`n_predict=16000`), HP buffer `sink=512 / recent=2048`, c
 | **INT2 + OSCAR calibrated rotation — K only (V=f16, isolation test)** | **6/6** (= f16) |
 | **INT2 + OSCAR calibrated rotation — full K+V** | **14/20 = 70%** |
 | f16 baseline (same n=20 sample) | 10/20 = 50% |
-| sglang OSCAR INT2 (reference, full 198-q) | ~62% |
+| external OSCAR INT2 reference (full 198-q) | ~62% |
 
 **Read this honestly:**
 - The decisive fix is the **data-calibrated rotation** (`R·H·P`), *not* plain Hadamard — Hadamard
@@ -33,7 +33,8 @@ Full chain-of-thought (`n_predict=16000`), HP buffer `sink=512 / recent=2048`, c
 - The n=20 used **stochastic decoding (temp ≈ 0.6)**, so INT2 and f16 sample *different*
   completions per question — that's why INT2 (70%) > f16 (50%) on this *hard* draw (sampling
   noise; both estimate the same true ~60-70%). The robust signals: n=6 INT2 == f16 (6/6),
-  per-token SQNR (calibrated ≫ Hadamard for K; sound for V), and the pipeline matching sglang's
+  per-token SQNR (calibrated ≫ Hadamard for K; sound for V), and the pipeline matching the external
+  OSCAR reference
   62% recipe.
 - All numbers are **CPU-validated** on small samples (CPU is ~28 min/q for K-INT2, ~90 min/q for
   full K+V INT2). A full 198-q representative run belongs on GPU/Metal.
@@ -49,8 +50,8 @@ Full chain-of-thought (`n_predict=16000`), HP buffer `sink=512 / recent=2048`, c
   / `attn_v_rot.weight`. Applied **in-graph, post-RoPE** in `src/models/qwen3.cpp` (`Q@M`, `K@M`;
   V rotated + `M_vᵀ` undo). The same orthogonal `M` hits both Q and K, so `Q'·K'` is exactly
   preserved and there is **no per-access undo** → fast.
-- **Outlier clip** — per-row percentile clamp before quant (`LLAMA_KV_CLIP_RATIO`, matches sglang
-  K=0.96 / V=0.92).
+- **Outlier clip** — per-row percentile clamp before quant (`LLAMA_KV_CLIP_RATIO`; OSCAR
+  calibration commonly uses K=0.96 / V=0.92).
 - **HP sink+recent buffer** — first `LLAMA_KV_HP_SINK` and last `LLAMA_KV_HP_RECENT` tokens kept
   high-precision; the rest INT2 (joint LP+HP attention).
 - Lloyd-Max INT2 levels; the in-quant Hadamard is gated behind `LLAMA_KV_NO_HADAMARD` (the
@@ -143,7 +144,7 @@ LLAMA_KV_HP_SINK=512 LLAMA_KV_HP_RECENT=2048 \
 The rotation matrices are **data-calibrated** from the model's own activations on GPQA (GPU needed
 for the dump; tooling lives in the CoQuant `rotation/` scripts):
 
-1. **Dump post-RoPE Q/K/V** on GPQA calibration prompts (sglang, ~1 min on an H100).
+1. **Dump post-RoPE Q/K/V** on GPQA calibration prompts with an activation-dump pipeline.
 2. **Compute rotations** — `METHOD=qqt_sst` (`R·H·P`): `R_k` from the query covariance, `R_v` from
    the value covariance → `k_rotation_qqt_r_h_pbr.pt`, `v_rotation_sst_r_h_pbr.pt` (36 × 128×128).
 3. **Bake into GGUF** — append the per-layer matrices (stored as `Mᵀ` so `ggml_mul_mat(rot,K)=K@M`)

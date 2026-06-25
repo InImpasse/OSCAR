@@ -21,6 +21,23 @@ static inline float q2_0_cuda_clip_ratio() {
     return clip_ratio ? (float) atof(clip_ratio) : 0.0f;
 }
 
+static inline float q2_0_cuda_clip_ratio_for_cache(const char * name) {
+    const bool is_k_cache = name && name[0] == 'c' && name[1] == 'a' && name[2] == 'c' && name[3] == 'h' && name[4] == 'e' && name[5] == '_' && name[6] == 'k';
+    const bool is_v_cache = name && name[0] == 'c' && name[1] == 'a' && name[2] == 'c' && name[3] == 'h' && name[4] == 'e' && name[5] == '_' && name[6] == 'v';
+    const char * clip_ratio = nullptr;
+
+    if (is_k_cache) {
+        clip_ratio = getenv("LLAMA_KV_CLIP_RATIO_K");
+    } else if (is_v_cache) {
+        clip_ratio = getenv("LLAMA_KV_CLIP_RATIO_V");
+    }
+
+    if (!clip_ratio) {
+        clip_ratio = getenv("LLAMA_KV_CLIP_RATIO");
+    }
+    return clip_ratio ? (float) atof(clip_ratio) : 0.0f;
+}
+
 static __host__ __device__ __forceinline__ int q2_0_group_size_cuda(const int n_dims) {
     return n_dims >= Q2_0_OWHT_GROUP_SIZE ? Q2_0_OWHT_GROUP_SIZE : QK2_0;
 }
@@ -149,9 +166,9 @@ static __device__ __forceinline__ void q2_0_quantize_group_owht_cuda(
     q2_0_clip_group_cuda(tmp, actual_n, clip_ratio);
 
     const int actual_nb = actual_n / QK2_0;
-    dst[0].m = __float2half(mean);
-    for (int ib = 1; ib < actual_nb; ++ib) {
-        dst[ib].m = __float2half(0.0f);
+    const half mean_h = __float2half(mean);
+    for (int ib = 0; ib < actual_nb; ++ib) {
+        dst[ib].m = mean_h;
     }
 
     for (int ib = 0; ib < actual_nb; ++ib) {

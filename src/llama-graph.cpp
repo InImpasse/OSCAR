@@ -20,6 +20,25 @@
 
 // dedup helpers
 
+static bool llama_kv_hp_prefill_attention_enabled() {
+    const char * e = getenv("LLAMA_KV_HP_PREFILL_ATTENTION");
+    return e && atoi(e);
+}
+
+static bool llama_kv_hp_skip_lp_store_diag_enabled(const llama_kv_cache_context * mctx) {
+    const char * e = getenv("LLAMA_KV_HP_SKIP_LP_STORE_DIAG");
+    return e && e[0] != '\0' && e[0] != '0' &&
+        mctx->has_hp() && mctx->get_n_hp_kv() >= mctx->get_n_kv_used();
+}
+
+static bool llama_kv_hp_should_build_attention(const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) {
+    if (getenv("LLAMA_KV_MIXED_VEC_RAW_FORCE_GRAPH")) {
+        return mctx->has_hp();
+    }
+    return mctx->get_n_hp_kv() > 0 &&
+        (ubatch.n_tokens <= 2*ubatch.n_seqs_unq || llama_kv_hp_prefill_attention_enabled());
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -450,11 +469,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
-
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, hp_kq_mask != nullptr);
+        const bool exclude_hp = hp_kq_mask != nullptr && []() {
+            const char * env = getenv("LLAMA_KV_HP_NO_EXCLUDE");
+            return !(env && env[0] != '\0' && env[0] != '0');
+        }();
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, exclude_hp);
     }
 
     if (self_k_rot) {
@@ -483,7 +509,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    if (self_k_idxs) {
+        res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    }
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
@@ -493,7 +521,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         const uint32_t n_hp_batch_cur = mctx->get_n_hp_batch();
         const bool had_hp = hp_k_idxs != nullptr;
         const bool has_hp_now = n_hp_batch_cur > 0;
-        const bool has_hp_attn_now = has_hp_now && mctx->get_n_hp_kv() > 0 && params.ubatch.n_tokens <= 2*params.ubatch.n_seqs_unq;
+        const bool has_hp_attn_now = has_hp_now && llama_kv_hp_should_build_attention(mctx, params.ubatch);
         if (had_hp != has_hp_now) {
             res = false;
         } else if (had_hp && hp_k_idxs->ne[0] != (int64_t)n_hp_batch_cur) {
@@ -1986,7 +2014,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * out_meta) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2019,6 +2048,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (out_meta) {
+            cur->src[8] = out_meta;
+        }
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2203,8 +2235,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        if (!llama_kv_hp_skip_lp_store_diag_enabled(mctx_cur)) {
+            inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+            inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        }
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
@@ -2213,13 +2247,23 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    // HP sink+recent writes are independent from HP attention. During prompt
-    // processing, keep filling HP but use the normal q2 FA path; enable the
-    // LP+HP joint attention graph for generation-sized batches.
-    if (mctx_cur->has_hp() && mctx_cur->get_n_hp_batch() > 0) {
-        inp->hp_k_idxs     = mctx_cur->build_input_hp_k_idxs(ctx0);
-        inp->hp_batch_idxs = mctx_cur->build_input_hp_batch_idxs(ctx0);
-        if (mctx_cur->get_n_hp_kv() > 0 && ubatch.n_tokens <= 2*ubatch.n_seqs_unq) {
+    // HP sink+recent writes are independent from HP attention. By default,
+    // prompt processing keeps filling HP but uses the normal q2 FA path; set
+    // LLAMA_KV_HP_PREFILL_ATTENTION=1 to also build LP+HP joint attention for
+    // prompt batches when comparing against mixed-window OSCAR references.
+    if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+        fprintf(stderr, "hp_graph_inp: has_hp=%d n_hp=%u n_hp_kv=%u n_hp_view=%u n_hp_batch=%u should_attn=%d n_tokens=%u n_seqs=%u\n",
+                mctx_cur->has_hp() ? 1 : 0, mctx_cur->get_n_hp(), mctx_cur->get_n_hp_kv(),
+                mctx_cur->get_n_hp_view(ubatch),
+                mctx_cur->get_n_hp_batch(), llama_kv_hp_should_build_attention(mctx_cur, ubatch) ? 1 : 0,
+                ubatch.n_tokens, ubatch.n_seqs_unq);
+    }
+    if (mctx_cur->has_hp() && (mctx_cur->get_n_hp_batch() > 0 || llama_kv_hp_should_build_attention(mctx_cur, ubatch))) {
+        if (mctx_cur->get_n_hp_batch() > 0) {
+            inp->hp_k_idxs     = mctx_cur->build_input_hp_k_idxs(ctx0);
+            inp->hp_batch_idxs = mctx_cur->build_input_hp_batch_idxs(ctx0);
+        }
+        if (llama_kv_hp_should_build_attention(mctx_cur, ubatch)) {
             inp->hp_kq_mask = mctx_cur->build_input_hp_kq_mask(ctx0, ubatch);
             if (inp->hp_kq_mask) {
                 inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
@@ -2272,29 +2316,59 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     // store to LP KV cache
-    {
+    if (inp->get_k_idxs() && inp->get_v_idxs()) {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * v_store = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        cb(k_store, "cache_k_set_rows", il);
+        cb(v_store, "cache_v_set_rows", il);
+        ggml_build_forward_expand(gf, k_store);
+        ggml_build_forward_expand(gf, v_store);
+    } else if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+        fprintf(stderr, "hp_diag: skip LP KV store layer=%d\n", il);
     }
+
+    ggml_tensor * k_hp_store = nullptr;
+    ggml_tensor * v_hp_store = nullptr;
 
     // store to HP KV cache (sink+recent tokens only)
     if (mctx_cur->has_hp() && inp->hp_batch_idxs) {
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k_hp(ctx0, k_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v_hp(ctx0, v_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il));
+        k_hp_store = mctx_cur->cpy_k_hp(ctx0, k_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il);
+        v_hp_store = mctx_cur->cpy_v_hp(ctx0, v_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il);
+        ggml_build_forward_expand(gf, k_hp_store);
+        ggml_build_forward_expand(gf, v_hp_store);
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
+    const bool hp_dep_barrier = []() {
+        const char * env = getenv("LLAMA_KV_HP_DEP_BARRIER");
+        return env && env[0] != '\0' && env[0] != '0';
+    }();
+    if (hp_dep_barrier && k_hp_store && v_hp_store) {
+        // Diagnostic dependency barrier: HP cache writes are side-effect ops and
+        // HP attention reads the cache through a later view. Make the dependency
+        // explicit without changing Q numerically.
+        ggml_tensor * hp_dep = ggml_add(ctx0,
+                ggml_sum(ctx0, ggml_cast(ctx0, k_hp_store, GGML_TYPE_F32)),
+                ggml_sum(ctx0, ggml_cast(ctx0, v_hp_store, GGML_TYPE_F32)));
+        hp_dep = ggml_scale(ctx0, hp_dep, 0.0f);
+        q = ggml_add(ctx0, q, hp_dep);
+    }
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur;
 
     if (mctx_cur->has_hp() && inp->hp_kq_mask) {
+        if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+            fprintf(stderr, "hp_attn_branch: n_hp=%u n_hp_kv=%u n_hp_view=%u n_kv_used=%u k_type=%d v_type=%d\n",
+                    mctx_cur->get_n_hp(), mctx_cur->get_n_hp_kv(), mctx_cur->get_n_hp_view(), mctx_cur->get_n_kv_used(),
+                    k->type, v->type);
+        }
         // Exact LP+HP attention via concatenated softmax (non-FA path):
         //   LP (e.g. Q2_0) and HP (e.g. F16) keys may differ in type — then K·Q uses two
         //   mul_mats plus concat; when LP/HP K share a type, concat K on the sequence axis
@@ -2306,21 +2380,99 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
         ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
 
+        if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+            const bool hp_only = mctx_cur->get_n_hp_kv() >= mctx_cur->get_n_kv_used();
+            const bool raw_oscar2 = getenv("LLAMA_KV_MIXED_VEC_RAW") && k->type == GGML_TYPE_OSCAR2_KV;
+            const bool fused_ok =
+                !getenv("LLAMA_KV_HP_NO_FUSED_Q2_0") &&
+                !getenv("LLAMA_KV_HP_NO_FUSED_Q2") &&
+                cparams.flash_attn &&
+                hparams.f_max_alibi_bias == 0.0f &&
+                (hparams.f_attn_logit_softcapping == 0.0f || raw_oscar2) &&
+                (k->type == GGML_TYPE_Q2_0 || k->type == GGML_TYPE_OSCAR2_KV) &&
+                v->type == k->type &&
+                k_hp->type == GGML_TYPE_F16 &&
+                v_hp->type == GGML_TYPE_F16;
+            fprintf(stderr,
+                    "hp_gate: hp_only=%d fused_ok=%d no_fused_q2_0=%d no_fused_q2=%d fa=%d alibi=%g softcap=%g k=%d v=%d khp=%d vhp=%d hp_kv=%u kv_used=%u q_ne2=%lld k_ne2=%lld hp_ne2=%lld\n",
+                    hp_only ? 1 : 0, fused_ok ? 1 : 0,
+                    getenv("LLAMA_KV_HP_NO_FUSED_Q2_0") ? 1 : 0,
+                    getenv("LLAMA_KV_HP_NO_FUSED_Q2") ? 1 : 0,
+                    cparams.flash_attn ? 1 : 0,
+                    (double) hparams.f_max_alibi_bias,
+                    (double) hparams.f_attn_logit_softcapping,
+                    k->type, v->type, k_hp->type, v_hp->type,
+                    mctx_cur->get_n_hp_kv(), mctx_cur->get_n_kv_used(),
+                    (long long) q->ne[2], (long long) k->ne[2], (long long) k_hp->ne[2]);
+        }
+
         // If sink+recent HP already covers the whole visible KV range, the LP
         // side is fully masked.  Use the HP f16 cache directly and avoid doing
         // q2 KQ work that would be discarded by the mask.
         if (mctx_cur->get_n_hp_kv() >= mctx_cur->get_n_kv_used()) {
             cur = build_attn_mha(q, k_hp, v_hp, nullptr, inp->hp_kq_mask_cnv, nullptr, nullptr, kq_scale, il);
             cb(cur, "kqv_hp_only", il);
-        } else if (!getenv("LLAMA_KV_HP_NO_FUSED_Q2_0") &&
-                   !getenv("LLAMA_KV_HP_NO_FUSED_Q2") &&
+        } else if (getenv("LLAMA_KV_HP_STAGED_COMBINE") &&
                    cparams.flash_attn &&
-                   hparams.f_max_alibi_bias == 0.0f &&
-                   hparams.f_attn_logit_softcapping == 0.0f &&
-                   k->type == GGML_TYPE_Q2_0 &&
-                   v->type == GGML_TYPE_Q2_0 &&
+                   (k->type == GGML_TYPE_OSCAR2_KV || k->type == GGML_TYPE_Q4_0) &&
+                   v->type == GGML_TYPE_OSCAR2_KV &&
                    k_hp->type == GGML_TYPE_F16 &&
+                   v_hp->type == GGML_TYPE_F16 &&
+                   !(k->type == GGML_TYPE_OSCAR2_KV && getenv("LLAMA_KV_HP_STAGED_FUSED_FIXUP"))) {
+            const bool staged_fused_fixup_requested = getenv("LLAMA_KV_HP_STAGED_FUSED_FIXUP") != nullptr;
+            // OSCAR2 LP staged FA currently dispatches through the vector FA backend,
+            // which does not consume the HP side inputs attached below.  Keep this
+            // path disabled for OSCAR2 so oscar_int2 always runs a real LP+HP combine.
+            const bool staged_fused_fixup = staged_fused_fixup_requested && k->type != GGML_TYPE_OSCAR2_KV;
+
+            ggml_tensor * lp_meta = nullptr;
+            const bool needs_lp_meta = !staged_fused_fixup &&
+                (k->type == GGML_TYPE_OSCAR2_KV || getenv("LLAMA_KV_HP_STAGED_META"));
+            if (needs_lp_meta) {
+                // FA returns flattened heads in ne[0], but CUDA meta is indexed
+                // per (token, head, sequence), matching Q after build_attn_mha().
+                int64_t meta_ne[4] = { 2, q->ne[1], q->ne[2], q->ne[3] };
+                lp_meta = ggml_new_tensor(ctx0, GGML_TYPE_F32, 4, meta_ne);
+                cb(lp_meta, "kqv_lp_staged_meta", il);
+            }
+            ggml_tensor * lp_cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, nullptr, kq_scale, il, lp_meta);
+            cb(lp_cur, "kqv_lp_staged_combine", il);
+
+            const int64_t n_stream = k->ne[3];
+            ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+            q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+            ggml_tensor * k_lp_p = ggml_permute(ctx0, k, 0, 2, 1, 3);
+            ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+            ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+            if (staged_fused_fixup) {
+                lp_cur->src[5] = k_hp_p;
+                lp_cur->src[6] = v_hp_p;
+                lp_cur->src[7] = inp->hp_kq_mask;
+                cur = lp_cur;
+                cb(cur, "kqv_hp_staged_fused_fixup", il);
+            } else {
+                cur = ggml_flash_attn_ext_mixed_combine(ctx0, lp_cur, lp_meta, q_perm, k_lp_p, inp->self_kq_mask,
+                                                        k_hp_p, v_hp_p, inp->hp_kq_mask, kq_scale,
+                                                        hparams.f_attn_logit_softcapping);
+                cb(cur, "kqv_hp_staged_combine", il);
+            }
+        } else if (!getenv("LLAMA_KV_HP_NO_FUSED_Q2_0") &&
+			                   !getenv("LLAMA_KV_HP_NO_FUSED_Q2") &&
+			                   cparams.flash_attn &&
+	                   hparams.f_max_alibi_bias == 0.0f &&
+		                   (hparams.f_attn_logit_softcapping == 0.0f ||
+		                    (getenv("LLAMA_KV_MIXED_VEC_RAW") && k->type == GGML_TYPE_OSCAR2_KV)) &&
+		                   (k->type == GGML_TYPE_Q2_0 || k->type == GGML_TYPE_OSCAR2_KV) &&
+		                   v->type == k->type &&
+	                   k_hp->type == GGML_TYPE_F16 &&
                    v_hp->type == GGML_TYPE_F16) {
+            if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                fprintf(stderr, "hp_fused_branch: raw=%d q_ne=%lld k_ne=%lld hp_ne=%lld\n",
+                        getenv("LLAMA_KV_MIXED_VEC_RAW") ? 1 : 0,
+                        (long long) q->ne[2], (long long) k->ne[2], (long long) k_hp->ne[2]);
+            }
             const int64_t n_stream = k->ne[3];
 
             ggml_tensor * q_fused = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
@@ -2332,9 +2484,22 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_tensor * k_hp_fused = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
             ggml_tensor * v_hp_fused = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
 
-            cur = ggml_flash_attn_ext_q2_0_f16(ctx0, q_fused, k_lp_fused, v_lp_fused, inp->self_kq_mask,
-                                            k_hp_fused, v_hp_fused, inp->hp_kq_mask, kq_scale);
-            cb(cur, "fattn_q2_0_f16", il);
+            if (getenv("LLAMA_KV_MIXED_VEC_RAW") && k->type == GGML_TYPE_OSCAR2_KV) {
+                if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                    fprintf(stderr, "hp_fused_branch: creating raw mixed op\n");
+                }
+                cur = ggml_flash_attn_ext_mixed(ctx0, q_fused, k_lp_fused, v_lp_fused, inp->self_kq_mask_cnv,
+                                                k_hp_fused, v_hp_fused, inp->hp_kq_mask,
+                                                kq_scale, 0.0f, hparams.f_attn_logit_softcapping);
+            } else {
+                if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                    fprintf(stderr, "hp_fused_branch: creating default mixed op\n");
+                }
+                cur = ggml_flash_attn_ext_mixed(ctx0, q_fused, k_lp_fused, v_lp_fused, inp->self_kq_mask,
+                                                k_hp_fused, v_hp_fused, inp->hp_kq_mask,
+                                                kq_scale, 0.0f, 0.0f);
+            }
+            cb(cur, k->type == GGML_TYPE_OSCAR2_KV ? "fattn_oscar2_f16" : "fattn_q2_0_f16", il);
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
         } else {
         const int64_t n_stream = k->ne[3];   // k: [n_embd_head_k, n_head_kv, n_kv, n_stream]

@@ -192,10 +192,68 @@ static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 b
 #define Q2_0_LM_T2 ( 0.6745f)
 typedef struct {
     ggml_half d;           // per-block sigma for Lloyd-Max centroids
-    ggml_half m;           // direct path: block mean; OWHT path: group mean in first block, otherwise zero
+    ggml_half m;           // direct path: block mean; OWHT path: replicated group mean
     uint8_t qs[QK2_0 / 4]; // 4 packed 2-bit Lloyd-Max centroid codes per byte [0..3]
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == 2 * sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+#define OSCAR2_K_C0 (-1.3500f)
+#define OSCAR2_K_C1 (-0.8600f)
+#define OSCAR2_K_C2 (-0.5200f)
+#define OSCAR2_K_C3 (-0.1850f)
+#define OSCAR2_K_C4 ( 0.1850f)
+#define OSCAR2_K_C5 ( 0.5200f)
+#define OSCAR2_K_C6 ( 0.8600f)
+#define OSCAR2_K_C7 ( 1.3500f)
+#define OSCAR2_K_T0 (-1.1050f)
+#define OSCAR2_K_T1 (-0.6900f)
+#define OSCAR2_K_T2 (-0.3525f)
+#define OSCAR2_K_T3 ( 0.0f)
+#define OSCAR2_K_T4 ( 0.3525f)
+#define OSCAR2_K_T5 ( 0.6900f)
+#define OSCAR2_K_T6 ( 1.1050f)
+#define OSCAR2_V_C0 (-1.0200f)
+#define OSCAR2_V_C1 (-0.3100f)
+#define OSCAR2_V_C2 ( 0.3100f)
+#define OSCAR2_V_C3 ( 1.0200f)
+#define OSCAR2_V3_C0 (-1.3500f)
+#define OSCAR2_V3_C1 (-0.8600f)
+#define OSCAR2_V3_C2 (-0.5200f)
+#define OSCAR2_V3_C3 (-0.1850f)
+#define OSCAR2_V3_C4 ( 0.1850f)
+#define OSCAR2_V3_C5 ( 0.5200f)
+#define OSCAR2_V3_C6 ( 0.8600f)
+#define OSCAR2_V3_C7 ( 1.3500f)
+#define OSCAR2_V_T0 (-0.774286f)
+#define OSCAR2_V_T1 ( 0.0f)
+#define OSCAR2_V_T2 ( 0.774286f)
+#define QK_OSCAR2_KV 128
+typedef struct {
+    ggml_half d;                         // per-128 sigma
+    ggml_half m;                         // per-128 mean
+    uint8_t qs[QK_OSCAR2_KV / 4];        // K/V: low 2 bits per value
+    uint8_t rs[QK_OSCAR2_KV / 8];        // K/V: one high/residual tier bit per value
+} block_oscar2_kv;
+static_assert(sizeof(block_oscar2_kv) == 2 * sizeof(ggml_half) + QK_OSCAR2_KV / 4 + QK_OSCAR2_KV / 8, "wrong oscar2 kv block size/padding");
+
+#define QK_TURBO2 128
+#define QR_TURBO2 1
+#define QI_TURBO2 (QK_TURBO2 / (4 * QR_TURBO2))
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO2 / 4];
+} block_turbo2_0;
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2 / 4, "wrong turbo2_0 block size/padding");
+
+#define QK_TURBO3 32
+#define QR_TURBO3 1
+#define QI_TURBO3 (QK_TURBO3 / (4 * QR_TURBO3))
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO3 / 4];
+    uint8_t   signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3 / 4 + QK_TURBO3 / 8, "wrong turbo3_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {

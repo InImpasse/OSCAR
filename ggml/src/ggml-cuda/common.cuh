@@ -965,6 +965,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TURBO2_0> {
+    static constexpr int qk = QK_TURBO2;
+    static constexpr int qr = QR_TURBO2;
+    static constexpr int qi = QI_TURBO2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TURBO3_0> {
+    static constexpr int qk = QK_TURBO3;
+    static constexpr int qr = QR_TURBO3;
+    static constexpr int qi = QI_TURBO3;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
     static constexpr int qr = QR4_0;
@@ -1576,4 +1590,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

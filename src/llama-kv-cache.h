@@ -176,6 +176,7 @@ public:
     // HP (high-precision) variants — only valid when n_hp_total > 0
     uint32_t get_n_hp() const { return n_hp_total; }
     uint32_t get_n_hp_kv(const slot_info & sinfo) const;
+    uint32_t get_n_hp_view(const slot_info & sinfo, const llama_ubatch & ubatch) const;
     ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
 
@@ -409,6 +410,8 @@ public:
     bool     has_hp()      const;
     uint32_t get_n_hp()    const;
     uint32_t get_n_hp_kv() const;
+    uint32_t get_n_hp_view() const;
+    uint32_t get_n_hp_view(const llama_ubatch & ubatch) const;
     uint32_t get_n_hp_batch() const;  // # HP tokens in current ubatch
     ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il) const;

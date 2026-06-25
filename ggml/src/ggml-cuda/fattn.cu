@@ -330,6 +330,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2_KV, GGML_TYPE_OSCAR2_KV)
+    FATTN_VEC_CASE(128, GGML_TYPE_OSCAR2_KV, GGML_TYPE_BF16)
+    FATTN_VEC_CASE(128, GGML_TYPE_BF16, GGML_TYPE_OSCAR2_KV)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_OSCAR2_KV)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
@@ -341,6 +345,105 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
+void ggml_cuda_flash_attn_ext_mixed_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int mixed_marker = ggml_get_op_params_i32(dst, 4);
+    if (mixed_marker == 2) {
+        if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+            fprintf(stderr, "mixed_graph_combine_dispatch\n");
+        }
+        ggml_cuda_flash_attn_ext_mixed_graph_combine_case<128>(ctx, dst);
+        return;
+    }
+    const bool use_raw = getenv("LLAMA_KV_MIXED_VEC_RAW") != nullptr && getenv("LLAMA_KV_MIXED_VEC_LEGACY") == nullptr;
+    const char * env_ncols = getenv("LLAMA_KV_MIXED_VEC_NCOLS");
+    if (env_ncols && atoi(env_ncols) == 8) {
+        if (use_raw) {
+            if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                fprintf(stderr, "mixed_raw_dispatch: ncols=8\n");
+            }
+            ggml_cuda_flash_attn_ext_mixed_vec_raw_case<128, 8>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mixed_vec_case<128, 8>(ctx, dst);
+        }
+    } else if (env_ncols && atoi(env_ncols) == 4) {
+        if (use_raw) {
+            if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                fprintf(stderr, "mixed_raw_dispatch: ncols=4\n");
+            }
+            ggml_cuda_flash_attn_ext_mixed_vec_raw_case<128, 4>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mixed_vec_case<128, 4>(ctx, dst);
+        }
+    } else {
+        if (use_raw) {
+            if (getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG")) {
+                fprintf(stderr, "mixed_raw_dispatch: ncols=4\n");
+            }
+            ggml_cuda_flash_attn_ext_mixed_vec_raw_case<128, 4>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mixed_vec_case<128, 4>(ctx, dst);
+        }
+    }
+}
+
+bool ggml_cuda_flash_attn_ext_mixed_vec_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    const bool raw_debug = getenv("LLAMA_KV_MIXED_VEC_RAW_DEBUG") != nullptr;
+    const int mixed_marker = ggml_get_op_params_i32(dst, 4);
+    if (mixed_marker != 1 && mixed_marker != 2) {
+        if (raw_debug && mixed_marker != 0) {
+            fprintf(stderr, "mixed_vec_supported: reject marker=%d\n", mixed_marker);
+        }
+        return false;
+    }
+
+    const bool main_enabled = []() {
+        const char * env = getenv("LLAMA_KV_MIXED_VEC_MAIN");
+        return env && env[0] != '\0' && env[0] != '0';
+    }();
+    const bool raw_enabled = []() {
+        const char * env = getenv("LLAMA_KV_MIXED_VEC_RAW");
+        return env && env[0] != '\0' && env[0] != '0' && getenv("LLAMA_KV_MIXED_VEC_LEGACY") == nullptr;
+    }();
+    if (mixed_marker == 1 && !main_enabled && !raw_enabled) {
+        return false;
+    }
+
+    const ggml_tensor * Q       = dst->src[0];
+    const ggml_tensor * K_lp    = dst->src[1];
+    const ggml_tensor * V_lp    = dst->src[2];
+    const ggml_tensor * mask_lp = dst->src[3];
+    const ggml_tensor * K_hp    = dst->src[5];
+    const ggml_tensor * V_hp    = dst->src[6];
+    const ggml_tensor * mask_hp = dst->src[7];
+    if (!Q || !K_lp || !V_lp || !mask_lp || !K_hp || !V_hp || !mask_hp) {
+        if (raw_debug) {
+            fprintf(stderr, "mixed_vec_supported: reject missing src q=%p k=%p v=%p mlp=%p khp=%p vhp=%p mhp=%p\n",
+                    (const void *) Q, (const void *) K_lp, (const void *) V_lp, (const void *) mask_lp,
+                    (const void *) K_hp, (const void *) V_hp, (const void *) mask_hp);
+        }
+        return false;
+    }
+
+    const bool ok = Q->type == GGML_TYPE_F32 &&
+           Q->ne[0] == 128 &&
+           ((mixed_marker == 1 && K_lp->type == GGML_TYPE_OSCAR2_KV) ||
+            (mixed_marker == 2 && (K_lp->type == GGML_TYPE_OSCAR2_KV || K_lp->type == GGML_TYPE_Q4_0))) &&
+           ((mixed_marker == 1 && V_lp->type == GGML_TYPE_OSCAR2_KV) ||
+            (mixed_marker == 2 && V_lp->type == GGML_TYPE_F32)) &&
+           K_hp->type == GGML_TYPE_F16 && V_hp->type == GGML_TYPE_F16 &&
+           ((mixed_marker == 1 && (raw_enabled ? mask_lp->type == GGML_TYPE_F16 : mask_lp->type == GGML_TYPE_F32)) ||
+            (mixed_marker == 2 && mask_lp->type == GGML_TYPE_F32)) &&
+           mask_hp->type == GGML_TYPE_F32;
+    if (raw_debug) {
+        fprintf(stderr, "mixed_vec_supported: marker=%d raw=%d main=%d ok=%d q_type=%d q_d=%lld k=%d v=%d mlp=%d khp=%d vhp=%d mhp=%d\n",
+                mixed_marker, raw_enabled ? 1 : 0, main_enabled ? 1 : 0, ok ? 1 : 0,
+                Q->type, (long long) Q->ne[0], K_lp->type, V_lp->type, mask_lp->type,
+                K_hp->type, V_hp->type, mask_hp->type);
+    }
+    return ok;
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
@@ -349,6 +452,53 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+static const char * ggml_cuda_best_fattn_kernel_name(best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:     return "none";
+        case BEST_FATTN_KERNEL_TILE:     return "tile";
+        case BEST_FATTN_KERNEL_VEC:      return "vec";
+        case BEST_FATTN_KERNEL_WMMA_F16: return "wmma_f16";
+        case BEST_FATTN_KERNEL_MMA_F16:  return "mma_f16";
+    }
+    return "unknown";
+}
+
+static void ggml_cuda_fattn_debug_print(
+        best_fattn_kernel kernel, const ggml_tensor * dst, bool gqa_opt_applies, bool can_use_vector_kernel) {
+    static bool enabled = []() {
+        const char * env = getenv("LLAMA_CUDA_FATTN_DEBUG");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    fprintf(stderr,
+            "fattn_debug: kernel=%s Q(type=%s ne=%lld,%lld,%lld,%lld"
+            " nb=%zu,%zu,%zu,%zu) K(type=%s ne=%lld,%lld,%lld,%lld"
+            " nb=%zu,%zu,%zu,%zu) V(type=%s ne=%lld,%lld,%lld,%lld"
+            " nb=%zu,%zu,%zu,%zu) mask=%s mask_ne=%lld,%lld,%lld,%lld"
+            " mask_nb=%zu,%zu,%zu,%zu gqa=%d gqa_opt=%d vec=%d\n",
+            ggml_cuda_best_fattn_kernel_name(kernel),
+            ggml_type_name(Q->type), (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+            Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3],
+            ggml_type_name(K->type), (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+            K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+            ggml_type_name(V->type), (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+            mask ? ggml_type_name(mask->type) : "null",
+            (long long) (mask ? mask->ne[0] : 0), (long long) (mask ? mask->ne[1] : 0),
+            (long long) (mask ? mask->ne[2] : 0), (long long) (mask ? mask->ne[3] : 0),
+            mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+            gqa_ratio, gqa_opt_applies, can_use_vector_kernel);
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -435,7 +585,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    const bool mixed_oscar2_bf16 =
+        ((K->type == GGML_TYPE_OSCAR2_KV && V->type == GGML_TYPE_BF16) ||
+         (K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_OSCAR2_KV)) && Q->ne[0] == 128;
+    const bool mixed_q4_oscar2 =
+        K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_OSCAR2_KV && Q->ne[0] == 128;
+    if (K->type != V->type && !mixed_oscar2_bf16 && !mixed_q4_oscar2) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -451,6 +606,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_OSCAR2_KV:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
@@ -468,10 +624,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
     const bool can_use_q2_vector_kernel = can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0);
 
-    if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
+    const char * allow_staged_oscar2_env = getenv("LLAMA_KV_OSCAR2_ALLOW_STAGED_FA");
+    const bool allow_staged_oscar2 = allow_staged_oscar2_env &&
+        allow_staged_oscar2_env[0] != '\0' && allow_staged_oscar2_env[0] != '0';
+
+    if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0 ||
+        (!allow_staged_oscar2 && (K->type == GGML_TYPE_OSCAR2_KV || V->type == GGML_TYPE_OSCAR2_KV))) {
         if (can_use_q2_vector_kernel) {
+            ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_VEC, dst, gqa_opt_applies, can_use_vector_kernel);
             return BEST_FATTN_KERNEL_VEC;
         }
+        ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_NONE, dst, gqa_opt_applies, can_use_vector_kernel);
         return BEST_FATTN_KERNEL_NONE;
     }
 
@@ -480,23 +643,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                    ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_VEC, dst, gqa_opt_applies, can_use_vector_kernel);
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
+                        ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_VEC, dst, gqa_opt_applies, can_use_vector_kernel);
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
                     if (Q->ne[1] == 1) {
+                        ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_VEC, dst, gqa_opt_applies, can_use_vector_kernel);
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
             }
             if (!gqa_opt_applies && Q->ne[1] == 1) {
+                ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_VEC, dst, gqa_opt_applies, can_use_vector_kernel);
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
+        ggml_cuda_fattn_debug_print(BEST_FATTN_KERNEL_MMA_F16, dst, gqa_opt_applies, can_use_vector_kernel);
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 

@@ -55,6 +55,14 @@ static void ortho_hadamard_f32(float * GGML_RESTRICT x, int n) {
 // Lloyd-Max optimal 4-level centroids for N(0,1) (reconstruction levels).
 // Decision thresholds: -0.6745σ, 0, +0.6745σ.
 static const float LM_CENTROIDS[4] = {Q2_0_LM_C0, Q2_0_LM_C1, Q2_0_LM_C2, Q2_0_LM_C3};
+static const float OSCAR2_K_CENTROIDS[8] = {
+    OSCAR2_K_C0, OSCAR2_K_C1, OSCAR2_K_C2, OSCAR2_K_C3,
+    OSCAR2_K_C4, OSCAR2_K_C5, OSCAR2_K_C6, OSCAR2_K_C7,
+};
+static const float OSCAR2_V_CENTROIDS[8] = {
+    OSCAR2_V3_C0, OSCAR2_V3_C1, OSCAR2_V3_C2, OSCAR2_V3_C3,
+    OSCAR2_V3_C4, OSCAR2_V3_C5, OSCAR2_V3_C6, OSCAR2_V3_C7,
+};
 
 // Quantize one value to a 2-bit Lloyd-Max code against per-block sigma.
 static inline uint8_t lm_quantize(float v, float inv_sigma) {
@@ -65,13 +73,49 @@ static inline uint8_t lm_quantize(float v, float inv_sigma) {
     return 3;
 }
 
-// Full head-vector OWHT size: apply Hadamard to the common 128-wide head group
-// so outliers spread across dims before per-block Lloyd-Max quantization.
-// Falls back to QK2_0=32 if k < the OWHT group size.
-#define Q2_0_HAD_SIZE Q2_0_OWHT_GROUP_SIZE
+static inline uint8_t q2_symmetric_quantize(float v, float inv_sigma, float t0, float t1, float t2) {
+    const float vs = v * inv_sigma;
+    if (vs < t0) return 0;
+    if (vs < t1) return 1;
+    if (vs < t2) return 2;
+    return 3;
+}
+
+static const float TURBO2_CENTROIDS[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+
+static const float TURBO3_CENTROIDS[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+static inline uint8_t turbo2_quantize(float v) {
+    if (v < -0.086728f) return 0;
+    if (v <  0.0f)      return 1;
+    if (v <  0.086728f) return 2;
+    return 3;
+}
+
+static inline uint8_t turbo3_quantize(float v) {
+    if (v < -0.154259f) return 0;
+    if (v < -0.091775f) return 1;
+    if (v < -0.043589f) return 2;
+    if (v <  0.0f)      return 3;
+    if (v <  0.043589f) return 4;
+    if (v <  0.091775f) return 5;
+    if (v <  0.154259f) return 6;
+    return 7;
+}
+
+// Full head-vector OWHT: apply Hadamard over the entire head dimension so outliers
+// spread across all dims before per-block Lloyd-Max quant. Q2_0_HAD_SIZE is the array
+// cap (max supported head_dim); the actual OWHT width is q2_0_had_size() = head_dim at
+// runtime (128 Qwen3, 512 Gemma4) via LLAMA_KV_HAD_SIZE. Falls back to QK2_0=32 if k < width.
+#define Q2_0_HAD_SIZE 512
 
 // OSCAR outlier clip: clamp each rotated head-vector to the clip_ratio percentile
-// of |value| (matches sglang SGLANG_OSCAR_*_CLIP_RATIO; K=0.96, V=0.92). One shared
+// of |value| (OSCAR calibration commonly uses K=0.96, V=0.92). One shared
 // ratio from LLAMA_KV_CLIP_RATIO (0 disables). Applied after OWHT, before quant.
 static int q2_0_cmp_abs_asc(const void * a, const void * b) {
     const float fa = *(const float *)a;
@@ -99,6 +143,19 @@ static int q2_0_skip_hadamard(void) {
     return v;
 }
 
+// Full-head OWHT width = head_dim (128 Qwen3, 256 Gemma). From LLAMA_KV_HAD_SIZE
+// (default 128), clamped to [QK2_0, Q2_0_HAD_SIZE].
+static int q2_0_had_size(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * e = getenv("LLAMA_KV_HAD_SIZE");
+        s = e ? atoi(e) : 128;
+        if (s < (int) QK2_0)   s = (int) QK2_0;
+        if (s > Q2_0_HAD_SIZE) s = Q2_0_HAD_SIZE;
+    }
+    return s;
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK2_0 == 0);
@@ -106,7 +163,7 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
 
     // Process in groups of (HAD_SIZE/QK2_0) blocks, each group gets a joint OWHT.
     // For k < Q2_0_HAD_SIZE, fall back to per-block (32-dim) OWHT.
-    const int had_n   = (k >= Q2_0_HAD_SIZE) ? Q2_0_HAD_SIZE : QK2_0;
+    const int had_n   = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
     const int had_nb  = had_n / QK2_0;  // blocks per Hadamard group
 
     float tmp[Q2_0_HAD_SIZE];
@@ -144,9 +201,11 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
             }
         }
 
-        // Store mean in first block's m field so dequant can restore it.
-        y[ig].m = GGML_FP32_TO_FP16(mean);
-        for (int ib = 1; ib < actual_nb; ib++) y[ig + ib].m = GGML_FP32_TO_FP16(0.0f);
+        // Store the group mean in *every* block's m field. The CPU dequant only
+        // reads the first block's m, but a per-block GPU dequant (Metal) cannot
+        // reach the group's first block from an arbitrary block, so replicating
+        // the mean into each block keeps the CPU and GPU decode paths identical.
+        for (int ib = 0; ib < actual_nb; ib++) y[ig + ib].m = GGML_FP32_TO_FP16(mean);
 
         for (int ib = 0; ib < actual_nb; ib++) {
             const float * blk = tmp + ib * QK2_0;
@@ -167,6 +226,85 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
             }
         }
     }
+}
+
+static void quantize_row_oscar2_ref_impl(
+        const float * GGML_RESTRICT x, block_oscar2_kv * GGML_RESTRICT y, int64_t k, bool use_k_3bit) {
+    assert(k % QK_OSCAR2_KV == 0);
+    const int nb = k / QK_OSCAR2_KV;
+    const char * env_k_residual = getenv("LLAMA_KV_OSCAR2_K_RESIDUAL");
+    const bool use_k_residual = use_k_3bit && env_k_residual && env_k_residual[0] != '\0' && env_k_residual[0] != '0';
+
+    for (int i = 0; i < nb; ++i) {
+        const float * src = x + i * QK_OSCAR2_KV;
+        float mean = 0.0f;
+        for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+            mean += src[j];
+        }
+        mean /= QK_OSCAR2_KV;
+
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_OSCAR2_KV; ++j) {
+            const float v = src[j] - mean;
+            sum_sq += v * v;
+        }
+
+        const float sigma = sqrtf(sum_sq / QK_OSCAR2_KV);
+        const float inv_sigma = sigma > 1e-8f ? 1.0f / sigma : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(sigma);
+        y[i].m = GGML_FP32_TO_FP16(mean);
+
+        for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+            uint8_t packed = 0;
+            for (int b = 0; b < 4; ++b) {
+                const float center = (!use_k_3bit || use_k_residual) ? mean : 0.0f;
+                const float v = (src[j * 4 + b] - center) * inv_sigma;
+                int q = 0;
+                const float * centroids = use_k_3bit ? OSCAR2_K_CENTROIDS : OSCAR2_V_CENTROIDS;
+                const int n_centroids = 8;
+                float best = fabsf(v - centroids[0]);
+                for (int qi = 1; qi < n_centroids; ++qi) {
+                    const float err = fabsf(v - centroids[qi]);
+                    if (err < best) {
+                        best = err;
+                        q = qi;
+                    }
+                }
+                packed |= (q & 0x03) << (2 * b);
+            }
+            y[i].qs[j] = packed;
+        }
+
+        for (int j = 0; j < QK_OSCAR2_KV / 8; ++j) {
+            uint8_t high = 0;
+            for (int b = 0; b < 8; ++b) {
+                const int idx = j * 8 + b;
+                const float center = (!use_k_3bit || use_k_residual) ? mean : 0.0f;
+                const float v = (src[idx] - center) * inv_sigma;
+                int q = 0;
+                const float * centroids = use_k_3bit ? OSCAR2_K_CENTROIDS : OSCAR2_V_CENTROIDS;
+                const int n_centroids = 8;
+                float best = fabsf(v - centroids[0]);
+                for (int qi = 1; qi < n_centroids; ++qi) {
+                    const float err = fabsf(v - centroids[qi]);
+                    if (err < best) {
+                        best = err;
+                        q = qi;
+                    }
+                }
+                high |= ((q >> 2) & 0x01) << b;
+            }
+            y[i].rs[j] = high;
+        }
+
+        if (use_k_3bit && !use_k_residual) {
+            y[i].m = GGML_FP32_TO_FP16(0.0f);
+        }
+    }
+}
+
+void quantize_row_oscar2_kv_ref(const float * GGML_RESTRICT x, block_oscar2_kv * GGML_RESTRICT y, int64_t k) {
+    quantize_row_oscar2_ref_impl(x, y, k, true);
 }
 
 void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k) {
@@ -200,6 +338,64 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
                 y[i].qs[byte_index] |= (1 << bit_offset);
             }
         }
+    }
+}
+
+void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2 == 0);
+
+    const int nb = k / QK_TURBO2;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_TURBO2;
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO2; ++j) {
+            norm_sq += xb[j] * xb[j];
+        }
+
+        const float norm = sqrtf(norm_sq);
+        const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        float recon_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO2; ++j) {
+            const uint8_t q = turbo2_quantize(xb[j] * inv_norm);
+            y[ib].qs[j / 4] |= (q & 0x03) << (2 * (j % 4));
+            recon_sq += TURBO2_CENTROIDS[q] * TURBO2_CENTROIDS[q];
+        }
+
+        const float recon_norm = sqrtf(recon_sq);
+        const float corrected = recon_norm > 1e-10f ? norm / recon_norm : norm;
+        y[ib].norm = GGML_FP32_TO_FP16(corrected);
+    }
+}
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+
+    const int nb = k / QK_TURBO3;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_TURBO3;
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO3; ++j) {
+            norm_sq += xb[j] * xb[j];
+        }
+
+        const float norm = sqrtf(norm_sq);
+        const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        memset(y[ib].signs, 0, sizeof(y[ib].signs));
+        float recon_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO3; ++j) {
+            const uint8_t q = turbo3_quantize(xb[j] * inv_norm);
+            y[ib].qs[j / 4] |= (q & 0x03) << (2 * (j % 4));
+            y[ib].signs[j / 8] |= ((q >> 2) & 0x01) << (j % 8);
+            recon_sq += TURBO3_CENTROIDS[q] * TURBO3_CENTROIDS[q];
+        }
+
+        const float recon_norm = sqrtf(recon_sq);
+        const float corrected = recon_norm > 1e-10f ? norm / recon_norm : norm;
+        y[ib].norm = GGML_FP32_TO_FP16(corrected);
     }
 }
 
@@ -514,7 +710,7 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     assert(k % QK2_0 == 0);
     const int nb = k / QK2_0;
 
-    const int had_n  = (k >= Q2_0_HAD_SIZE) ? Q2_0_HAD_SIZE : QK2_0;
+    const int had_n  = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
     const int had_nb = had_n / QK2_0;
 
     float tmp[Q2_0_HAD_SIZE];
@@ -544,6 +740,31 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+static void dequantize_row_oscar2_impl(
+        const block_oscar2_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k,
+        const float * GGML_RESTRICT centroids) {
+    GGML_UNUSED(centroids);
+    assert(k % QK_OSCAR2_KV == 0);
+    const int nb = k / QK_OSCAR2_KV;
+
+    for (int i = 0; i < nb; ++i) {
+        const float sigma = GGML_FP16_TO_FP32(x[i].d);
+        float * dst = y + i * QK_OSCAR2_KV;
+        for (int j = 0; j < QK_OSCAR2_KV / 4; ++j) {
+            const uint8_t packed = x[i].qs[j];
+            for (int b = 0; b < 4; ++b) {
+                const int idx = j * 4 + b;
+                const int q = ((packed >> (2 * b)) & 0x03) | (((x[i].rs[idx / 8] >> (idx % 8)) & 0x01) << 2);
+                dst[idx] = GGML_FP16_TO_FP32(x[i].m) + sigma * centroids[q];
+            }
+        }
+    }
+}
+
+void dequantize_row_oscar2_kv(const block_oscar2_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_oscar2_impl(x, y, k, OSCAR2_K_CENTROIDS);
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -560,6 +781,34 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const int bit_offset = j % 8;
             const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
             y[i*qk + j] = bit ? d : neg_d;
+        }
+    }
+}
+
+void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2 == 0);
+
+    const int nb = k / QK_TURBO2;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].norm);
+        for (int j = 0; j < QK_TURBO2; ++j) {
+            const uint8_t q = (x[ib].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            y[ib * QK_TURBO2 + j] = norm * TURBO2_CENTROIDS[q];
+        }
+    }
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+
+    const int nb = k / QK_TURBO3;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].norm);
+        for (int j = 0; j < QK_TURBO3; ++j) {
+            const uint8_t low = (x[ib].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            const uint8_t hi  = (x[ib].signs[j / 8] >> (j % 8)) & 0x01;
+            const uint8_t q = low | (hi << 2);
+            y[ib * QK_TURBO3 + j] = norm * TURBO3_CENTROIDS[q];
         }
     }
 }
@@ -2207,6 +2456,28 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     UNUSED(quant_weights);
     quantize_row_q2_0_ref(src, dst, (int64_t)nrow * n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+}
+
+size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % QK_TURBO2 == 0);
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO2_0, n_per_row);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_turbo2_0_ref(src + row * n_per_row, (block_turbo2_0 *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % QK_TURBO3 == 0);
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO3_0, n_per_row);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_turbo3_0_ref(src + row * n_per_row, (block_turbo3_0 *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return nrow * row_size;
 }
 
 size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
