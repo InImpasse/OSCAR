@@ -36,9 +36,10 @@ def wilson_interval(correct: int, total: int, z: float = 1.96) -> Tuple[float, f
     margin = z * sqrt((p * (1 - p) + z2 / 4) / total) / (1 + z2)
     return (center - margin, center + margin)
 
-cache_dir = Path.home() / ".cache" / "huggingface" / "datasets"
+_hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+cache_dir = Path(os.environ.get("HF_DATASETS_CACHE", str(_hf_home / "datasets")))
 cache_dir.mkdir(parents=True, exist_ok=True)
-os.environ["HF_DATASETS_CACHE"] = str(cache_dir)
+os.environ.setdefault("HF_DATASETS_CACHE", str(cache_dir))
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 GRADER_PATTERNS = {
@@ -121,6 +122,7 @@ D) {D}
 Remember to put your final answer inside \\boxed{{}}.
 """,
     "humaneval": """Complete the following Python function. Return only valid Python code for the completion.
+Do not include Markdown fences, explanations, tests, or the function signature.
 
 {prompt}""",
 }
@@ -669,7 +671,9 @@ class EvalState:
             question, prompt, expected = self.get_case(i)
             case = cases.get(task_id, {})
             status = case.get("status", "pending")
-            answer = case.get("answer", "N/A") if status == "ok" else "N/A"
+            answer = case.get("answer")
+            answer = "N/A" if answer is None else str(answer)
+            expected_str = "N/A" if expected is None else str(expected)
             tokens = case.get("tokens")
             tokens_str = str(tokens) if tokens is not None else "N/A"
             tps_gen = case.get("tps_gen")
@@ -685,7 +689,7 @@ class EvalState:
                 question_trunc += "..."
             else:
                 question_trunc = question_trunc.ljust(43) + "..."
-            print(f"  {task_id:<20} {self.dataset_type.upper()}   {question_trunc:<40}    {expected:<10} {answer:<10} {tokens_str:<6} {tps_str:<6} {t_gen_str:<8} {symbol}{status}  {server_name}")
+            print(f"  {task_id:<20} {self.dataset_type.upper()}   {question_trunc:<40}    {expected_str:<10} {answer:<10} {tokens_str:<6} {tps_str:<6} {t_gen_str:<8} {symbol}{status}  {server_name}")
         print()
 
     def print_existing_summary(self):
@@ -781,13 +785,11 @@ class Aime2025Dataset(BaseDataset):
         print(f"Loading AIME2025 dataset...")
         from datasets import load_dataset
 
+        # Use the default HF datasets cache (HF_DATASETS_CACHE). A custom cache_dir
+        # under ~/.cache/huggingface/datasets breaks offline/mirror reloads because
+        # the hub loader script for this dataset is not available locally.
         config_name = "AIME2025-I"
-        cache_path = cache_dir / "opencompass___AIME2025" / "default" / "0.0.0"
-        if cache_path.exists():
-            print(f"Using cached dataset from {cache_path}")
-            ds = load_dataset("opencompass/AIME2025", config_name, split="test", cache_dir=str(cache_path))
-        else:
-            ds = load_dataset("opencompass/AIME2025", config_name, split="test")
+        ds = load_dataset("opencompass/AIME2025", config_name, split="test")
 
         self.questions = []
         for row in ds:
@@ -799,12 +801,7 @@ class Aime2025Dataset(BaseDataset):
 
         print(f"Loading AIME2025 dataset (part 2)...")
         config_name_2 = "AIME2025-II"
-        cache_path_2 = cache_dir / "opencompass___AIME2025" / "default" / "0.0.0"
-        if cache_path_2.exists():
-            print(f"Using cached dataset from {cache_path_2}")
-            ds_2 = load_dataset("opencompass/AIME2025", config_name_2, split="test", cache_dir=str(cache_path_2))
-        else:
-            ds_2 = load_dataset("opencompass/AIME2025", config_name_2, split="test")
+        ds_2 = load_dataset("opencompass/AIME2025", config_name_2, split="test")
 
         for row in ds_2:
             question = dict(row)
@@ -946,8 +943,12 @@ class GpqaDataset(BaseDataset):
         print(f"Loading GPQA dataset (variant: {self.variant})...")
         import pandas as pd
 
-        url = f"https://openaipublic.blob.core.windows.net/simple-evals/gpqa_{self.variant}.csv"
-        df = pd.read_csv(url)
+        local_csv = os.environ.get("GPQA_CSV_PATH")
+        if local_csv:
+            df = pd.read_csv(local_csv)
+        else:
+            url = f"https://openaipublic.blob.core.windows.net/simple-evals/gpqa_{self.variant}.csv"
+            df = pd.read_csv(url)
 
         rng = random.Random(self.seed)
 
@@ -1089,10 +1090,39 @@ class Grader:
             return GRADER_PATTERNS.get(self.dataset_type)  # Use dataset_type as key
         return None
 
+    @staticmethod
+    def _strip_thinking_blocks(text: str) -> str:
+        """Remove Granite-style thinking blocks before math answer extraction."""
+        if not text:
+            return text
+        cleaned = text
+        thinking_patterns = (
+            r"<\s*think\s*>.*?</\s*think\s*>",
+            r"<think>.*?</think>",
+        )
+        for pattern in thinking_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        return cleaned.strip()
+
+    def prepare_grade_text(self, response: str, reasoning_content: Optional[str] = None) -> str:
+        """Choose the text passed to graders for each dataset."""
+        merged = response or ""
+        if reasoning_content:
+            merged = f"{merged}\n{reasoning_content}".strip()
+        if self.dataset_type == "humaneval":
+            # HumanEval executes generated code; tail truncation breaks valid completions.
+            return merged
+        if self.dataset_type in ("aime", "aime2025", "aime2026"):
+            return self._strip_thinking_blocks(merged)
+        return self._truncate_response(merged, max_lines=10)
+
     def _extract_answer_regex(self, pred: str) -> Optional[str]:
         """Extract answer using regex pattern"""
         if not self.pattern:
             return None
+
+        if self.dataset_type in ("aime", "aime2025", "aime2026"):
+            pred = self._strip_thinking_blocks(pred)
 
         if self.dataset_type == "gpqa":
             answer_matches = re.findall(r'(?:^|\n)\s*Answer\s*:\s*([ABCD])\b', pred)
@@ -1103,13 +1133,16 @@ class Grader:
                 return standalone_matches[-1].strip()
             return None
 
-        # For AIME datasets, prioritize boxed answers
-        if self.dataset_type in ["aime", "aime2025"]:
+        # For math-style datasets, prioritize explicitly boxed final answers.
+        if self.dataset_type in ["aime", "aime2025", "gsm8k", "math500"]:
             boxed_pattern = r'\\boxed{([^}]+)}'
             boxed_matches = re.findall(boxed_pattern, pred, re.IGNORECASE)
             if boxed_matches:
                 # Return the last boxed answer found (most likely the final answer)
                 return boxed_matches[-1].strip()
+            if self.dataset_type in ["aime", "aime2025", "aime2026"]:
+                # AIME answers must be explicitly boxed; avoid picking stray digits from reasoning.
+                return None
 
         # For other datasets, search for numbers from the end of the text
         # This prioritizes numbers that appear later in the response
@@ -1147,13 +1180,70 @@ class Grader:
         problems = read_problems()
         if gold not in problems:
             return False, None
-        completion = pred
-        if completion.startswith(problem):
-            completion = completion[len(problem):]
-        completion = completion.split("```")[0]
-        sample = {"task_id": gold, "completion": completion}
-        result = check_correctness(problems[gold], sample, timeout=10.0)
-        return bool(result.get("passed")), "passed" if result.get("passed") else result.get("result")
+        last_result = None
+        for completion in self._humaneval_completion_candidates(pred, problems[gold]["prompt"]):
+            try:
+                result = check_correctness(problems[gold], completion, timeout=10.0)
+            except TypeError:
+                sample = {"task_id": gold, "completion": completion}
+                result = check_correctness(problems[gold], sample, timeout=10.0)
+            last_result = result
+            if result.get("passed"):
+                return True, "passed"
+        if last_result is None:
+            return False, None
+        return False, last_result.get("result")
+
+    @staticmethod
+    def _humaneval_completion_candidates(pred: str, problem_prompt: str) -> List[str]:
+        def normalize(code: str) -> str:
+            code = code.replace("```python", "```").strip("\n")
+            if code.startswith("python\n"):
+                code = code[len("python\n"):]
+            if problem_prompt in code:
+                code = code.split(problem_prompt, 1)[1]
+            return code.rstrip() + "\n"
+
+        def extract_repeated_function_body(code: str) -> Optional[str]:
+            match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", problem_prompt)
+            if not match:
+                return None
+            name = match.group(1)
+            lines = code.splitlines()
+            start = next((i for i, line in enumerate(lines) if re.match(rf"\s*def\s+{re.escape(name)}\s*\(", line)), None)
+            if start is None:
+                return None
+            body = lines[start + 1:]
+            if not body:
+                return None
+            in_doc = False
+            kept = []
+            for line in body:
+                stripped = line.strip()
+                if not kept and (stripped.startswith('"""') or stripped.startswith("'''")):
+                    if stripped.count('"""') == 1 or stripped.count("'''") == 1:
+                        in_doc = True
+                    continue
+                if in_doc:
+                    if '"""' in stripped or "'''" in stripped:
+                        in_doc = False
+                    continue
+                if kept or stripped:
+                    kept.append(line)
+            return "\n".join(kept).rstrip() + "\n" if kept else None
+
+        raw_blocks = [pred.split("```", 1)[0]]
+        raw_blocks.extend(re.findall(r"```(?:python)?\s*\n(.*?)```", pred, flags=re.DOTALL | re.IGNORECASE))
+        raw_blocks.append(pred)
+
+        candidates = []
+        seen = set()
+        for block in raw_blocks:
+            for candidate in (normalize(block), extract_repeated_function_body(block)):
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+        return candidates
 
     def _grade_cli(self, gold: str, pred: str) -> Tuple[bool, Optional[str]]:
         """Grade using external CLI script"""
@@ -1273,13 +1363,21 @@ class Processor:
     def _make_request(
         self, server_config: ServerConfig, eval_state: EvalState, prompt: str
     ) -> Tuple[Dict[str, Any], int, Optional[float], Optional[float], str]:
-        url = f"{server_config.url}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
-        data = {
-            "model": self.model_name if self.model_name else "llama",
-            "messages": [{"role": "user", "content": prompt}],
-            "n_predict": self.n_predict
-        }
+        if os.environ.get("LLAMA_EVAL_API") == "completions":
+            url = f"{server_config.url}/v1/completions"
+            data = {
+                "model": self.model_name if self.model_name else "llama",
+                "prompt": prompt,
+                "max_tokens": self.n_predict,
+            }
+        else:
+            url = f"{server_config.url}/v1/chat/completions"
+            data = {
+                "model": self.model_name if self.model_name else "llama",
+                "messages": [{"role": "user", "content": prompt}],
+                "n_predict": self.n_predict
+            }
         if eval_state.sampling_config.get("temperature") is not None:
             data["temperature"] = eval_state.sampling_config["temperature"]
         if eval_state.sampling_config.get("top_k") is not None:
@@ -1321,8 +1419,13 @@ class Processor:
 
         try:
             response, tokens, tps_gen, t_gen_ms, finish_reason = self._make_request(server_config, eval_state, prompt)
-            result = response["choices"][0]["message"]["content"]
-            reasoning_content = response["choices"][0].get("message", {}).get("reasoning_content")
+            choice = response["choices"][0]
+            if "message" in choice:
+                result = choice["message"]["content"]
+                reasoning_content = choice.get("message", {}).get("reasoning_content")
+            else:
+                result = choice.get("text", "")
+                reasoning_content = None
             task_state.response = result
             task_state.tokens = tokens
             task_state.tps_gen = tps_gen
@@ -1340,13 +1443,14 @@ class Processor:
                 eval_state.dump()
                 return task_state
 
-            result_truncated = self.grader._truncate_response(result, max_lines=10)
-            is_correct, answer = self.grader.grade(expected, result_truncated, prompt)
+            grade_text = self.grader.prepare_grade_text(result, reasoning_content)
+            is_correct, answer = self.grader.grade(expected, grade_text, prompt)
 
             grader_log = {
-                "pred": result_truncated,
+                "pred": grade_text if self.grader.dataset_type == "humaneval" else self.grader._truncate_response(grade_text, max_lines=10),
                 "grader_type": self.grader.grader_type,
                 "finish_reason": finish_reason,
+                "grade_used_full_response": self.grader.dataset_type == "humaneval",
             }
             if self.grader.grader_type == "regex" and self.grader.pattern:
                 grader_log["pattern"] = self.grader.pattern
