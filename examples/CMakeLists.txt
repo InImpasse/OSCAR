@@ -16,6 +16,7 @@ if (EMSCRIPTEN)
 else()
     add_subdirectory(batched)
     add_subdirectory(debug)
+    add_subdirectory(rot-kv-calibrate)
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
 

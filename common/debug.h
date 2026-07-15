@@ -28,4 +28,7 @@ struct common_debug_cb_user_data {
     common_debug_cb_user_data & operator=(const common_debug_cb_user_data &) = delete;
 
     common_debug_cb_user_data(common_params & params, const std::vector<std::string> & filter_patterns, bool abort_on_nan = false);
+
+    void set_dump_dir(const std::string & dump_dir);
+    void reset_dump_counters();
 };

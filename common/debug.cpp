@@ -48,6 +48,17 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
     params.cb_eval_user_data = this;
 }
 
+void common_debug_cb_user_data::set_dump_dir(const std::string & dump_dir) {
+    pimpl->dump_dir = dump_dir;
+    if (!dump_dir.empty()) {
+        std::filesystem::create_directories(dump_dir);
+    }
+}
+
+void common_debug_cb_user_data::reset_dump_counters() {
+    pimpl->dump_counts.clear();
+}
+
 static std::string common_ggml_ne_string(const ggml_tensor * t) {
     std::string str;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {

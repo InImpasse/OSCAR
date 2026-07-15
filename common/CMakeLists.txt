@@ -71,6 +71,10 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    oscar_oskv.cpp
+    oscar_oskv.h
+    oscar_qkv_callback.cpp
+    oscar_qkv_callback.h
     download.cpp
     download.h
     fit.cpp

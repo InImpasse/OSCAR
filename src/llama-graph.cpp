@@ -1213,6 +1213,11 @@ llm_graph_qkv llm_graph_context::build_qkv(
     return { Qcur, Kcur, Vcur };
 }
 
+static bool llm_arch_is_granite_family(llm_arch arch) {
+    return arch == LLM_ARCH_GRANITE ||
+           arch == LLM_ARCH_GRANITE_MOE ||
+           arch == LLM_ARCH_GRANITE_HYBRID;
+}
 
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
@@ -1355,14 +1360,17 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
-            // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
+        ggml_tensor * down_w = down;
+        if (llm_arch_is_granite_family(arch) && down_w->type != GGML_TYPE_F32) {
+            // Granite FFN down hits bad F16 CPU matmul results on some hosts; F32 weights match reference math.
+            down_w = ggml_cast(ctx0, down_w, GGML_TYPE_F32);
+        }
+        cur = build_lora_mm(down_w, cur);
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2 ||
+            llm_arch_is_granite_family(arch)) {
+            // GLM4, GLM4_MOE, JAIS2, and Granite seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
-    }
-
-    if (down_b) {
         cb(cur, "ffn_down", il);
     }
 
